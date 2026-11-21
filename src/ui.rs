@@ -75,6 +75,8 @@ pub enum Wid {
     TolUp,
     RateDn,
     RateUp,
+    HumanDn,
+    HumanUp,
     Pedal,
     Drums,
     Roblox,
@@ -88,6 +90,8 @@ pub struct Model {
     /// None = automatic (follows FPS)
     pub tol_ms: Option<i32>,
     pub rate: i32,
+    /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
+    pub human: u8,
     pub pedal: bool,
     pub drums: bool,
     pub roblox_only: bool,
@@ -113,6 +117,7 @@ impl Default for Model {
             transpose: 0,
             tol_ms: None,
             rate: 200,
+            human: 0,
             pedal: true,
             drums: false,
             roblox_only: true,
@@ -142,6 +147,7 @@ impl Model {
             drums: self.drums,
             tolerance: self.tol_ms.map(|t| t as f64),
             max_rate: Some(self.rate as f64),
+            human: self.human,
             ..Settings::default()
         }
     }
@@ -182,6 +188,8 @@ impl Model {
             }
             Wid::RateDn => self.rate -= 25,
             Wid::RateUp => self.rate += 25,
+            Wid::HumanDn => self.human = self.human.saturating_sub(1),
+            Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
@@ -232,12 +240,13 @@ const M: f32 = 20.0;
 const RIGHT_W: f32 = 340.0;
 const VIS_CARD: R = R::new(M, 72.0, W - M * 3.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(M, H - M - 84.0, W - M * 3.0 - RIGHT_W, 84.0);
-const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 412.0);
-const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 412.0 + 12.0, RIGHT_W, H - M - (72.0 + 412.0 + 12.0));
+const SET_H: f32 = 454.0;
+const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
+const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const ROW0: f32 = SET_CARD.y + 56.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 5.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -275,7 +284,7 @@ pub fn widgets() -> Vec<(R, Wid)> {
     for i in 0..FPS_CHOICES.len() {
         v.push((seg_rect(i), Wid::Fps(i as u8)));
     }
-    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp)];
+    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp), (Wid::HumanDn, Wid::HumanUp)];
     for (i, (dn, up)) in pairs.iter().enumerate() {
         let (a, b) = stepper_rects(i + 1);
         v.push((a, *dn));
@@ -906,7 +915,7 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(if sel { 0xFFFFFF } else { SUB }, la), &t);
     }
 
-    let rows: [(&str, &str, String, Wid, Wid); 4] = [
+    let rows: [(&str, &str, String, Wid, Wid); 5] = [
         ("재생 속도", "", format!("{:.2}x", m.speed), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
@@ -925,6 +934,13 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             if m.rate == 0 { "무제한".into() } else { format!("{}", m.rate) },
             Wid::RateDn,
             Wid::RateUp,
+        ),
+        (
+            "사람처럼 연주",
+            "타이밍 오차 · 화음 엇갈림",
+            crate::humanize::LEVEL_NAMES[m.human as usize].into(),
+            Wid::HumanDn,
+            Wid::HumanUp,
         ),
     ];
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {
@@ -991,12 +1007,12 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 
     let total = (s.kept + s.dropped).max(1);
     let pct = 100.0 * s.kept as f64 / total as f64;
-    let y = c.y + 50.0;
+    let y = c.y + 44.0;
     let w = cv.text(c.x + 20.0, y, 30.0, true, col(TEXT, 1.0), &format!("{pct:.1}"));
     cv.text(c.x + 20.0 + w + 2.0, y + 13.0, 15.0, true, col(SUB, 1.0), "%");
     cv.text(c.x + 20.0 + w + 26.0, y + 15.0, 12.0, false, col(SUB, 1.0), "원래 자리에서 연주되는 음");
     // ratio bar
-    let by = y + 46.0;
+    let by = y + 42.0;
     let bwid = c.w - 40.0;
     cv.rr(c.x + 20.0, by, bwid, 6.0, 3.0, col(0x252D3F, 1.0));
     let p = hgrad(c.x + 20.0, c.x + 20.0 + bwid, col(ACCENT, 1.0), col(ACCENT2, 1.0));
@@ -1011,7 +1027,7 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
     let cw = (c.w - 40.0) / 4.0;
     for (i, (k, v)) in cells.iter().enumerate() {
         let x = c.x + 20.0 + i as f32 * cw;
-        cv.text(x, by + 20.0, 11.0, false, col(DIM, 1.0), k);
-        cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
+        cv.text(x, by + 16.0, 11.0, false, col(DIM, 1.0), k);
+        cv.text(x, by + 32.0, 14.5, true, col(TEXT, 1.0), v);
     }
 }

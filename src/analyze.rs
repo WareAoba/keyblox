@@ -1,6 +1,6 @@
 //! Shared "load + schedule + report" used by both the GUI and the CLI.
 
-use crate::{midi, schedule};
+use crate::{humanize, midi, schedule};
 
 #[derive(Clone, Copy)]
 pub struct Settings {
@@ -16,11 +16,13 @@ pub struct Settings {
     pub tolerance: Option<f64>,
     /// strikes per second cap (None = default, 0 = unlimited)
     pub max_rate: Option<f64>,
+    /// human feel: 0 = off, 1..=3 = light / medium / strong (see humanize.rs)
+    pub human: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { fps: 60.0, speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, max_rate: None }
+        Settings { fps: 60.0, speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, max_rate: None, human: 0 }
     }
 }
 
@@ -70,7 +72,16 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         max_rate: st.max_rate.unwrap_or(base.max_rate).max(0.0),
     };
     let t0 = std::time::Instant::now();
-    let s = schedule::build(&parsed.events, p);
+    let human = humanize::level(st.human);
+    let humanized;
+    let events = match human {
+        Some(h) => {
+            humanized = humanize::apply(&parsed.events, h);
+            &humanized
+        }
+        None => &parsed.events,
+    };
+    let s = schedule::build(events, p);
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let verdict = schedule::verify(&s.actions, p);
 
@@ -84,6 +95,12 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         p.dwell as f64 / 1e3, st.fps, p.tolerance as f64 / 1e3,
         if p.max_rate > 0.0 { format!("{:.0}", p.max_rate) } else { "제한 없음".into() }
     ));
+    if let Some(h) = human {
+        r.push(format!(
+            "사람처럼 연주: {} (타이밍 오차 표준편차 {:.0}ms, 화음 엇갈림 최대 {:.0}ms, 아래 지연은 이 시각 기준)",
+            humanize::LEVEL_NAMES[st.human as usize], h.jitter as f64 / 1e3, h.lead as f64 / 1e3
+        ));
+    }
     let kept = 100.0 * s.strikes as f64 / (s.strikes + s.dropped).max(1) as f64;
     r.push(format!(
         "연주하는 음 {}개 / 뺀 음 {}개 (유지율 {:.1}%)   (계산 {:.0}ms)",
