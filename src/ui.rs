@@ -206,6 +206,13 @@ impl Model {
         self.rate = self.rate.clamp(0, 1000);
         true
     }
+    /// A different song was opened: speed/tempo is kept per song only.
+    pub fn open_song(&mut self, name: String) {
+        self.file_name = Some(name);
+        self.summary = None;
+        self.speed = 1.0;
+        self.set_vis(vec![]);
+    }
     /// Original BPM of the loaded song, when it uses a single tempo.
     pub fn base_bpm(&self) -> Option<f64> {
         self.summary.as_ref().and_then(|s| s.bpm)
@@ -1061,6 +1068,15 @@ mod tests {
         m.click_setting(Wid::SpeedUp);
         assert_eq!(m.speed, 1.05);
         assert_eq!(m.speed_text(), "1.05x");
+    }
+
+    #[test]
+    fn opening_another_song_resets_speed() {
+        let mut m = Model::default();
+        m.speed = 1.1;
+        m.open_song("b.mid".into());
+        assert_eq!(m.speed, 1.0);
+        assert_eq!(m.file_name.as_deref(), Some("b.mid"));
     }
 }
 
