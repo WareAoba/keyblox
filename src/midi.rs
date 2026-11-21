@@ -33,6 +33,8 @@ pub struct Parsed {
     pub folded: usize,
     pub pedal_changes: usize,
     pub length_us: i64,
+    /// Original BPM when every note plays under one tempo (None: tempo changes, or timecode timing)
+    pub bpm: Option<f64>,
 }
 
 enum Raw {
@@ -100,6 +102,8 @@ pub fn parse(bytes: &[u8], opt: &Options) -> Result<Parsed, String> {
     let mut pedal_changes = 0;
     let mut chan_pedal = [false; 16];
     let mut pedal_any = false;
+    let mut heard_tempo: Option<u128> = None; // tempo in effect at note-ons
+    let mut mixed_tempo = tc_div.is_some();
 
     for (tick, _, r) in raw {
         let us = if let Some(div) = tc_div {
@@ -125,6 +129,8 @@ pub fn parse(bytes: &[u8], opt: &Options) -> Result<Parsed, String> {
                     folded += 1;
                 }
                 notes += 1;
+                mixed_tempo |= heard_tempo.is_some_and(|h| h != tempo);
+                heard_tempo = Some(tempo);
                 events.push(Ev { t, kind: Kind::NoteOn(f) });
             }
             Raw::Off(_, k) => {
@@ -148,7 +154,8 @@ pub fn parse(bytes: &[u8], opt: &Options) -> Result<Parsed, String> {
     // stable: keeps file order for equal (t, kind-class)
     events.sort_by_key(|e| (e.t, class(e.kind)));
     let length_us = events.last().map(|e| e.t).unwrap_or(0);
-    Ok(Parsed { events, tempo_changes, notes, folded, pedal_changes, length_us })
+    let bpm = heard_tempo.filter(|_| !mixed_tempo).map(|t| 60e6 / t as f64);
+    Ok(Parsed { events, tempo_changes, notes, folded, pedal_changes, length_us, bpm })
 }
 
 fn class(k: Kind) -> u8 {
@@ -225,5 +232,25 @@ pub mod tests {
             (0, Kind::Pedal(true)), (0, Kind::NoteOn(22)),
             (250_000, Kind::NoteOff(22)), (250_000, Kind::Pedal(false)),
         ]);
+    }
+
+    #[test]
+    fn single_tempo_bpm() {
+        let notes = || vec![ev(0, on(60)), ev(480, off(60)), ev(0, on(62)), ev(480, off(62))];
+        // no tempo event -> MIDI default 120 BPM
+        assert_eq!(parse(&write(vec![notes()]), &opts()).unwrap().bpm, Some(120.0));
+        // the same tempo repeated in several tracks is still one tempo
+        let c1 = vec![ev(0, tempo(400_000))];
+        let mut t2 = vec![ev(0, tempo(400_000))];
+        t2.extend(notes());
+        assert_eq!(parse(&write(vec![c1, t2]), &opts()).unwrap().bpm, Some(150.0));
+        // a change after the last note doesn't affect what is heard
+        let mut t = vec![ev(0, tempo(500_000))];
+        t.extend(notes());
+        t.push(ev(480, tempo(1_000_000)));
+        assert_eq!(parse(&write(vec![t]), &opts()).unwrap().bpm, Some(120.0));
+        // a real change between notes -> not a single-tempo song
+        let t = vec![ev(0, tempo(500_000)), ev(0, on(60)), ev(480, off(60)), ev(0, tempo(250_000)), ev(0, on(62)), ev(480, off(62))];
+        assert_eq!(parse(&write(vec![t]), &opts()).unwrap().bpm, None);
     }
 }

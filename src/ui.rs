@@ -163,8 +163,14 @@ impl Model {
         }
         match w {
             Wid::Fps(i) => self.fps_idx = i as usize,
-            Wid::SpeedDn => self.speed = ((self.speed - 0.05) * 100.0).round() / 100.0,
-            Wid::SpeedUp => self.speed = ((self.speed + 0.05) * 100.0).round() / 100.0,
+            // single-tempo songs step by whole BPM, others by 0.05x
+            Wid::SpeedDn | Wid::SpeedUp => {
+                let d = if w == Wid::SpeedUp { 1.0 } else { -1.0 };
+                self.speed = match self.base_bpm() {
+                    Some(b) => ((b * self.speed).round() + d) / b,
+                    None => ((self.speed + d * 0.05) * 100.0).round() / 100.0,
+                }
+            }
             Wid::TransDn => self.transpose -= 1,
             Wid::TransUp => self.transpose += 1,
             Wid::TolDn => {
@@ -200,9 +206,23 @@ impl Model {
         self.rate = self.rate.clamp(0, 1000);
         true
     }
+    /// Original BPM of the loaded song, when it uses a single tempo.
+    pub fn base_bpm(&self) -> Option<f64> {
+        self.summary.as_ref().and_then(|s| s.bpm)
+    }
+    pub fn speed_text(&self) -> String {
+        match self.base_bpm() {
+            Some(b) => format!("{} BPM", bpm_text(b * self.speed)),
+            None => format!("{:.2}x", self.speed),
+        }
+    }
     pub fn length_us(&self) -> i64 {
         self.summary.as_ref().map(|s| s.length_us).unwrap_or(0)
     }
+}
+
+fn bpm_text(b: f64) -> String {
+    if (b - b.round()).abs() < 0.05 { format!("{:.0}", b) } else { format!("{:.1}", b) }
 }
 
 // ---------------------------------------------------------------- layout
@@ -578,7 +598,7 @@ fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
     if let Some(su) = &m.summary {
-        (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok).hash(&mut h);
+        (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok, su.bpm.map(f64::to_bits)).hash(&mut h);
     }
     h.finish()
 }
@@ -906,8 +926,12 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(if sel { 0xFFFFFF } else { SUB }, la), &t);
     }
 
+    let (speed_label, speed_sub) = match m.base_bpm() {
+        Some(b) => ("템포", format!("원곡 {} BPM", bpm_text(b))),
+        None => ("재생 속도", String::new()),
+    };
     let rows: [(&str, &str, String, Wid, Wid); 4] = [
-        ("재생 속도", "", format!("{:.2}x", m.speed), Wid::SpeedDn, Wid::SpeedUp),
+        (speed_label, &speed_sub, m.speed_text(), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
             "허용 지연",
@@ -1015,3 +1039,28 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
         cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_tempo_song_steps_speed_by_whole_bpm() {
+        let mut m = Model::default();
+        m.summary = Some(Summary { bpm: Some(120.0), ..Summary::default() });
+        assert_eq!(m.speed_text(), "120 BPM");
+        assert!(m.click_setting(Wid::SpeedUp));
+        assert!((m.speed - 121.0 / 120.0).abs() < 1e-12);
+        assert_eq!(m.speed_text(), "121 BPM");
+        m.click_setting(Wid::SpeedDn);
+        m.click_setting(Wid::SpeedDn);
+        assert_eq!(m.speed_text(), "119 BPM");
+        // multi-tempo songs keep the plain multiplier
+        m.summary = Some(Summary { bpm: None, ..Summary::default() });
+        m.speed = 1.0;
+        m.click_setting(Wid::SpeedUp);
+        assert_eq!(m.speed, 1.05);
+        assert_eq!(m.speed_text(), "1.05x");
+    }
+}
+
