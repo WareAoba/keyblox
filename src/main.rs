@@ -22,14 +22,15 @@ fn main() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: keyblox <file.mid> [--fps N] [--tol MS] [--dump-ons]");
+        eprintln!("usage: keyblox <file.mid> [--fps N] [--tol MS] [--rate N] [--window MS] [--dump-ons]");
         std::process::exit(1);
     };
     let mut st = analyze::Settings::default();
     let val = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
     if let Some(f) = val("--fps") { st.fps = f; }
     if let Some(t) = val("--tol") { st.tolerance = Some(t); }
-    if let Some(r) = val("--rate") { st.max_rate = Some(r); }
+    if let Some(r) = val("--rate") { st.rate_count = Some(r.max(0.0) as usize); }
+    if let Some(w) = val("--window") { st.rate_window = Some(w); }
     let bytes = std::fs::read(path).expect("read");
     if args.iter().any(|a| a == "--dump-acts") {
         let a = analyze::analyze(&bytes, &st).unwrap();

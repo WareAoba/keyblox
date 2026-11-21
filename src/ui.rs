@@ -16,7 +16,7 @@ use tiny_skia::{
 };
 
 pub const W: f32 = 1120.0;
-pub const H: f32 = 700.0;
+pub const H: f32 = 742.0;
 pub const FPS_CHOICES: [f64; 5] = [60.0, 120.0, 144.0, 165.0, 240.0];
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
@@ -75,6 +75,8 @@ pub enum Wid {
     TolUp,
     RateDn,
     RateUp,
+    WinDn,
+    WinUp,
     Pedal,
     Drums,
     Roblox,
@@ -87,7 +89,9 @@ pub struct Model {
     pub transpose: i32,
     /// None = automatic (follows FPS)
     pub tol_ms: Option<i32>,
+    /// strikes allowed per `rate_win_ms` (0 = unlimited)
     pub rate: i32,
+    pub rate_win_ms: i32,
     pub pedal: bool,
     pub drums: bool,
     pub roblox_only: bool,
@@ -112,7 +116,8 @@ impl Default for Model {
             speed: 1.0,
             transpose: 0,
             tol_ms: None,
-            rate: 200,
+            rate: 20,
+            rate_win_ms: 100,
             pedal: true,
             drums: false,
             roblox_only: true,
@@ -141,7 +146,8 @@ impl Model {
             pedal: self.pedal,
             drums: self.drums,
             tolerance: self.tol_ms.map(|t| t as f64),
-            max_rate: Some(self.rate as f64),
+            rate_count: Some(self.rate as usize),
+            rate_window: Some(self.rate_win_ms as f64),
             ..Settings::default()
         }
     }
@@ -180,8 +186,10 @@ impl Model {
                     Some(t) => Some(t + 5),
                 }
             }
-            Wid::RateDn => self.rate -= 25,
-            Wid::RateUp => self.rate += 25,
+            Wid::RateDn => self.rate -= 1,
+            Wid::RateUp => self.rate += 1,
+            Wid::WinDn => self.rate_win_ms -= 10,
+            Wid::WinUp => self.rate_win_ms += 10,
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
@@ -197,7 +205,8 @@ impl Model {
         self.speed = self.speed.clamp(0.25, 3.0);
         self.transpose = self.transpose.clamp(-24, 24);
         self.tol_ms = self.tol_ms.map(|t| t.clamp(0, 150));
-        self.rate = self.rate.clamp(0, 1000);
+        self.rate = self.rate.clamp(0, 200);
+        self.rate_win_ms = self.rate_win_ms.clamp(10, 1000);
         true
     }
     pub fn length_us(&self) -> i64 {
@@ -232,12 +241,12 @@ const M: f32 = 20.0;
 const RIGHT_W: f32 = 340.0;
 const VIS_CARD: R = R::new(M, 72.0, W - M * 3.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(M, H - M - 84.0, W - M * 3.0 - RIGHT_W, 84.0);
-const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 412.0);
-const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 412.0 + 12.0, RIGHT_W, H - M - (72.0 + 412.0 + 12.0));
+const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 454.0);
+const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 454.0 + 12.0, RIGHT_W, H - M - (72.0 + 454.0 + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const ROW0: f32 = SET_CARD.y + 56.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 5.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -275,7 +284,7 @@ pub fn widgets() -> Vec<(R, Wid)> {
     for i in 0..FPS_CHOICES.len() {
         v.push((seg_rect(i), Wid::Fps(i as u8)));
     }
-    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp)];
+    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp), (Wid::WinDn, Wid::WinUp)];
     for (i, (dn, up)) in pairs.iter().enumerate() {
         let (a, b) = stepper_rects(i + 1);
         v.push((a, *dn));
@@ -574,7 +583,7 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (m.fps_idx, m.speed.to_bits(), m.transpose, m.tol_ms, m.rate).hash(&mut h);
+    (m.fps_idx, m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms).hash(&mut h);
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
     if let Some(su) = &m.summary {
@@ -906,7 +915,7 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(if sel { 0xFFFFFF } else { SUB }, la), &t);
     }
 
-    let rows: [(&str, &str, String, Wid, Wid); 4] = [
+    let rows: [(&str, &str, String, Wid, Wid); 5] = [
         ("재생 속도", "", format!("{:.2}x", m.speed), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
@@ -920,11 +929,18 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             Wid::TolUp,
         ),
         (
-            "초당 최대 타건",
+            "최대 타건",
             "Roblox 렉 방지 · 0 = 무제한",
-            if m.rate == 0 { "무제한".into() } else { format!("{}", m.rate) },
+            if m.rate == 0 { "무제한".into() } else { format!("{}회", m.rate) },
             Wid::RateDn,
             Wid::RateUp,
+        ),
+        (
+            "제한 구간",
+            "이 시간 안에 최대 타건까지",
+            format!("{} ms", m.rate_win_ms),
+            Wid::WinDn,
+            Wid::WinUp,
         ),
     ];
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {

@@ -14,6 +14,7 @@
 
 use crate::layout::{key_for, Mod, SC_LCTRL, SC_LSHIFT, SC_SPACE};
 use crate::midi::{Ev, Kind};
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -25,8 +26,10 @@ pub struct Params {
     pub gap: i64,
     /// how late a note may be struck at most; anything later is removed
     pub tolerance: i64,
-    /// max key strikes per second (0 = unlimited); keeps Roblox from choking
-    pub max_rate: f64,
+    /// at most this many key strikes in any `rate_window` (0 = unlimited);
+    /// keeps Roblox from choking
+    pub rate_count: usize,
+    pub rate_window: i64,
 }
 
 /// Default tolerance: enough to roll a chord that needs all three modifier
@@ -43,7 +46,7 @@ impl Params {
     pub fn from_fps(fps: f64) -> Self {
         // 1.25 frames: guarantees a frame boundary with margin for frame jitter
         let f = (1_000_000.0 / fps * 1.25).round() as i64;
-        Params { dwell: f + COALESCE_US, hold: 0, gap: 0, tolerance: auto_tolerance(f + COALESCE_US), max_rate: 200.0 }
+        Params { dwell: f + COALESCE_US, hold: 0, gap: 0, tolerance: auto_tolerance(f + COALESCE_US), rate_count: 20, rate_window: 100_000 }
     }
 }
 
@@ -255,16 +258,20 @@ fn choose(notes: &[Note], p: Params) -> Vec<(usize, i64)> {
     path
 }
 
-/// Keep the strike rate under `rate` per second (token bucket: refills at
-/// `rate`/s, holds at most BURST, so a lone big chord still sounds full while
-/// a sustained flood is thinned evenly). When a moment must lose notes, its
-/// highest (melody) and lowest (bass) notes are kept first, then top-down.
-fn limit_rate(notes: &[Note], path: Vec<(usize, i64)>, rate: f64) -> Vec<(usize, i64)> {
-    if rate <= 0.0 || path.is_empty() {
+/// Keep at most `count` strikes in any `window` (sliding window; strike times
+/// along the path never decrease, so a queue of recent strikes is enough).
+/// A token bucket (refills `count` per `window`, never holds more than the
+/// window still allows) runs alongside, so a sustained flood is thinned
+/// evenly instead of in bursts at the start of each window, while a lone
+/// chord of up to `count` notes still sounds full. When a moment must lose notes, its highest (melody) and
+/// lowest (bass) notes are kept first, then top-down.
+fn limit_rate(notes: &[Note], path: Vec<(usize, i64)>, count: usize, window: i64) -> Vec<(usize, i64)> {
+    if count == 0 || window <= 0 {
         return path;
     }
-    let burst = (rate * 0.35).max(4.0);
-    let mut tokens = burst;
+    let mut recent: VecDeque<i64> = VecDeque::new();
+    let per_us = count as f64 / window as f64;
+    let mut tokens = count as f64;
     let mut last_t = path[0].1;
     let mut kept: Vec<(usize, i64)> = Vec::with_capacity(path.len());
     let mut i = 0;
@@ -275,7 +282,12 @@ fn limit_rate(notes: &[Note], path: Vec<(usize, i64)>, rate: f64) -> Vec<(usize,
             j += 1;
         }
         let now = path[i].1;
-        tokens = (tokens + (now - last_t).max(0) as f64 * rate / 1e6).min(burst);
+        while recent.front().is_some_and(|&x| x <= now - window) {
+            recent.pop_front();
+        }
+        // tokens never exceed what the window still allows, so a window that
+        // was filled early does not release a second burst when it slides
+        tokens = (tokens + (now - last_t) as f64 * per_us).min(count.saturating_sub(recent.len()) as f64);
         last_t = now;
         let mut group: Vec<(usize, i64)> = path[i..j].to_vec();
         let take = (tokens.floor() as usize).min(group.len());
@@ -290,6 +302,7 @@ fn limit_rate(notes: &[Note], path: Vec<(usize, i64)>, rate: f64) -> Vec<(usize,
             group.sort_by_key(|x| x.0); // back to path order (keeps modifier grouping)
         }
         tokens -= group.len() as f64;
+        recent.extend(group.iter().map(|x| x.1));
         kept.extend(group);
         i = j;
     }
@@ -330,7 +343,7 @@ pub fn build(events: &[Ev], p: Params) -> Schedule {
     let end = events.last().map(|e| e.t).unwrap_or(0);
     let (notes, n_on, merged) = collect_notes(events, end);
     let path = choose(&notes, p);
-    let path = limit_rate(&notes, path, p.max_rate);
+    let path = limit_rate(&notes, path, p.rate_count, p.rate_window);
 
     // timeline of what will actually be played
     #[derive(Clone, Copy)]
@@ -565,7 +578,7 @@ pub fn verify(actions: &[Action], p: Params) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const P: Params = Params { dwell: 20_000, hold: 0, gap: 0, tolerance: 20_000, max_rate: 0.0 };
+    const P: Params = Params { dwell: 20_000, hold: 0, gap: 0, tolerance: 20_000, rate_count: 0, rate_window: 100_000 };
 
     fn on(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOn(n) } }
     fn off(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOff(n) } }
@@ -658,23 +671,43 @@ mod tests {
 
     #[test]
     fn rate_limit_keeps_melody_and_bass() {
-        // 10-note chords every 10 ms = 1000 notes/s, limited to 150/s
+        // 10-note chords every 10 ms = 1000 notes/s, limited to 15 per 100 ms
         let mut v = vec![];
         for i in 0..300i64 {
             for n in [36u8, 40, 43, 48, 52, 55, 60, 64, 67, 72] { v.push(on(i * 10_000, n)); v.push(off(i * 10_000 + 9_000, n)); }
         }
-        let p = Params { max_rate: 150.0, ..P };
+        let p = Params { rate_count: 15, rate_window: 100_000, ..P };
         let s = check(&sorted(v), p);
-        // any 1 s holds at most rate + burst strikes
-        let burst = (150.0f64 * 0.35) as usize + 1;
+        // no 100 ms window ever holds more than 15 strikes
         let downs: Vec<i64> = s.actions.iter().filter(|a| a.note.is_some()).map(|a| a.t).collect();
         for (k, &t) in downs.iter().enumerate() {
-            assert!(downs[k..].iter().take_while(|&&x| x < t + 1_000_000).count() <= 150 + burst);
+            assert!(downs[k..].iter().take_while(|&&x| x < t + 100_000).count() <= 15);
         }
+        // the limit is used, not over-thinned
+        assert!(downs.len() >= 15 * 28, "kept {}", downs.len());
         // the top and bottom voices survive the most
         let count = |pt: u8| s.actions.iter().filter(|a| matches!(a.note, Some((q, _)) if q == pt)).count();
         assert!(count(72) >= count(55) && count(36) >= count(55));
         assert!(count(72) > 250, "melody kept nearly every time: {}", count(72));
+    }
+
+    #[test]
+    fn rate_limit_window_is_user_set() {
+        // 5-note chord every 50 ms: 2 chords per 100 ms window
+        let mut v = vec![];
+        for i in 0..40i64 {
+            for n in [48u8, 52, 55, 60, 64] { v.push(on(i * 50_000, n)); v.push(off(i * 50_000 + 40_000, n)); }
+        }
+        let ev = sorted(v);
+        // 10 per 100 ms: everything fits
+        assert_eq!(check(&ev, Params { rate_count: 10, rate_window: 100_000, ..P }).dropped, 0);
+        // same count over a 200 ms window: about half must go
+        let s = check(&ev, Params { rate_count: 10, rate_window: 200_000, ..P });
+        let downs: Vec<i64> = s.actions.iter().filter(|a| a.note.is_some()).map(|a| a.t).collect();
+        for (k, &t) in downs.iter().enumerate() {
+            assert!(downs[k..].iter().take_while(|&&x| x < t + 200_000).count() <= 10);
+        }
+        assert!((90..=100).contains(&s.strikes), "kept {}", s.strikes);
     }
 
     #[test]
