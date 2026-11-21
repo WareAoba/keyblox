@@ -49,6 +49,14 @@ static ACTIONS: Mutex<Option<Arc<Vec<Action>>>> = Mutex::new(None);
 static ORIGIN_US: AtomicI64 = AtomicI64::new(0); // song start, in us since EPOCH
 static SEEK_US: AtomicI64 = AtomicI64::new(-1);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+static PLAYBACK: OnceLock<thread::Thread> = OnceLock::new();
+
+/// Wake the playback thread when it is idle (it parks instead of polling).
+fn wake() {
+    if let Some(t) = PLAYBACK.get() {
+        t.unpark();
+    }
+}
 
 fn since_epoch_us(t: Instant) -> i64 {
     let e = *EPOCH.get_or_init(Instant::now);
@@ -70,6 +78,7 @@ pub fn position_us() -> i64 {
 pub fn seek(us: i64) {
     POS_US.store(us.max(0), SeqCst);
     SEEK_US.store(us.max(0), SeqCst);
+    wake();
 }
 pub fn input_blocked() -> bool {
     BLOCKED.load(SeqCst)
@@ -94,6 +103,7 @@ pub fn has_song() -> bool {
 pub fn stop() {
     STATE.store(ST_STOPPED, SeqCst);
     STOP.store(true, SeqCst);
+    wake();
 }
 
 /// Play/pause (F6 or the GUI button).
@@ -116,6 +126,7 @@ pub fn toggle() {
 
 pub fn shutdown() {
     QUIT.store(true, SeqCst);
+    wake();
     for _ in 0..200 {
         if EXITED.load(SeqCst) {
             break;
@@ -130,6 +141,7 @@ fn start_now() {
         STOP.store(true, SeqCst);
     }
     STATE.store(ST_PLAYING, SeqCst);
+    wake();
 }
 
 fn foreground() -> usize {
@@ -276,7 +288,9 @@ fn playback() {
             POS_US.store(sk, SeqCst);
         }
         if state() != ST_PLAYING {
-            thread::sleep(Duration::from_millis(2));
+            // every control call (start, stop, seek, quit) unparks us; the
+            // timeout is only a safety net
+            thread::park_timeout(Duration::from_millis(100));
             continue;
         }
         if fresh {
@@ -403,6 +417,7 @@ pub fn init() {
         timeBeginPeriod(1);
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     }
-    thread::spawn(playback);
+    let t = thread::spawn(playback);
+    let _ = PLAYBACK.set(t.thread().clone());
     thread::spawn(hotkeys);
 }

@@ -297,6 +297,32 @@ pub fn seek_fraction(x: f32) -> f64 {
     (((x - sb.x) / sb.w) as f64).clamp(0.0, 1.0)
 }
 
+/// The part of the window that changes while a song plays (visualizer and
+/// transport). Everything else comes from the static layer.
+pub fn dynamic_rect() -> R {
+    R::new(VIS_CARD.x, VIS_CARD.y, VIS_CARD.w.max(TRANSPORT.w), TRANSPORT.y + TRANSPORT.h - VIS_CARD.y)
+}
+
+/// Seek bar fill as a fraction of the song.
+fn progress(m: &Model) -> f32 {
+    let len = m.length_us();
+    (if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 }) as f32
+}
+
+/// Changes exactly when the moving part of the frame would look different:
+/// every position while falling notes are shown, otherwise only when the
+/// clock or the seek bar (in quarter device pixels) moves, or the input-blocked
+/// warning appears.
+pub fn frame_key(m: &Model, scale: f32) -> i64 {
+    let shown = if m.vis_on && !m.vis.is_empty() {
+        m.pos_us
+    } else {
+        let bar = (seek_bar().w * progress(m) * scale * 4.0).round() as i64;
+        (m.pos_us.max(0) / 1_000_000) << 24 | bar
+    };
+    shown << 1 | m.blocked as i64
+}
+
 // ---------------------------------------------------------------- canvas
 pub struct Fonts {
     regular: Font,
@@ -321,6 +347,15 @@ pub struct Canvas {
     /// static layer (everything that does not move every frame)
     bg: Option<Pixmap>,
     bg_sig: u64,
+    /// translucent visualizer overlays that never change: [hit-line glow, top fade + legend]
+    over: Option<[Layer; 2]>,
+}
+
+/// Pre-rendered premultiplied RGBA rows `y0..` (full canvas width), blended
+/// over each frame instead of re-running gradients and text.
+struct Layer {
+    y0: usize,
+    px: Vec<u8>,
 }
 
 fn rrect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
@@ -377,7 +412,7 @@ fn hgrad(x0: f32, x1: f32, c0: Color, c1: Color) -> Paint<'static> {
 impl Canvas {
     pub fn new(scale: f32, fonts: Fonts) -> Canvas {
         let pm = Pixmap::new((W * scale).round() as u32, (H * scale).round() as u32).unwrap();
-        Canvas { pm, s: scale, fonts, cache: HashMap::new(), bg: None, bg_sig: 0 }
+        Canvas { pm, s: scale, fonts, cache: HashMap::new(), bg: None, bg_sig: 0, over: None }
     }
     pub fn set_scale(&mut self, scale: f32) {
         if (scale - self.s).abs() > 0.001 {
@@ -385,6 +420,7 @@ impl Canvas {
             self.pm = Pixmap::new((W * scale).round() as u32, (H * scale).round() as u32).unwrap();
             self.cache.clear();
             self.bg = None;
+            self.over = None;
         }
     }
     fn tf(&self) -> Transform {
@@ -441,6 +477,34 @@ impl Canvas {
                     d[1] = px[1] + ((d[1] as u32 * inv) >> 8) as u8;
                     d[2] = px[2] + ((d[2] as u32 * inv) >> 8) as u8;
                     d[3] = px[3] + ((d[3] as u32 * inv) >> 8) as u8;
+                }
+            }
+        }
+    }
+    /// Draw with `f` onto a transparent canvas and keep rows `y0..y1` (logical).
+    fn layer(&mut self, y0: f32, y1: f32, f: impl FnOnce(&mut Canvas)) -> Layer {
+        let blank = Pixmap::new(self.pm.width(), self.pm.height()).unwrap();
+        let saved = std::mem::replace(&mut self.pm, blank);
+        f(self);
+        let drawn = std::mem::replace(&mut self.pm, saved);
+        let (w, h) = (drawn.width() as usize * 4, drawn.height() as usize);
+        let r0 = ((y0 * self.s).floor().max(0.0) as usize).min(h);
+        let r1 = ((y1 * self.s).ceil().max(0.0) as usize + 1).min(h).max(r0);
+        Layer { y0: r0, px: drawn.data()[r0 * w..r1 * w].to_vec() }
+    }
+    /// Source-over blend of a premultiplied layer.
+    fn blend(&mut self, l: &Layer) {
+        let start = l.y0 * self.pm.width() as usize * 4;
+        let dst = &mut self.pm.data_mut()[start..start + l.px.len()];
+        for (d, s) in dst.chunks_exact_mut(4).zip(l.px.chunks_exact(4)) {
+            match s[3] {
+                0 => {}
+                255 => d.copy_from_slice(s),
+                a => {
+                    let inv = 255 - a as u32;
+                    for k in 0..4 {
+                        d[k] = s[k].saturating_add(((d[k] as u32 * inv + 127) / 255) as u8);
+                    }
                 }
             }
         }
@@ -757,10 +821,8 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
         }
     }
 
-    // hit line glow
-    let glow = vgrad(hit_y - 18.0, hit_y, col(ACCENT, 0.0), col(ACCENT, 0.35));
-    cv.rr_paint(area.x, hit_y - 18.0, area.w, 18.0, 0.0, &glow);
-    cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 0.9));
+    let over = cv.over.take().unwrap_or_else(|| build_overlays(cv));
+    cv.blend(&over[0]);
 
     // lit keys over the cached keyboard
     let mut redraw_black = [false; 128];
@@ -798,17 +860,33 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
         cv.rr(area.cx() - 70.0, area.y + 16.0, 140.0, 30.0, 15.0, col(CARD2, 0.95));
         cv.text_c(area.cx(), area.y + 31.0, 13.0, false, col(TEXT, 1.0), "다시 분석 중…");
     }
-    // soft fade where notes enter at the top
-    let fade = vgrad(area.y, area.y + 36.0, col(0x0A0D14, 1.0), col(0x0A0D14, 0.0));
-    cv.rr_paint(area.x, area.y, area.w, 36.0, 0.0, &fade);
-    // legend on a dark pill so notes never cover it
-    let lw: f32 = ["흰건반", "Shift", "Ctrl", "뺀 음"].iter().map(|t| cv.measure(11.5, false, t) + 30.0).sum::<f32>() + 6.0;
-    cv.rr(area.x + 8.0, area.y + 8.0, lw, 24.0, 12.0, col(0x0A0D14, 0.85));
-    let mut lx = area.x + 18.0;
-    for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
-        cv.rr(lx, area.y + 15.0, 10.0, 10.0, 3.0, col(c, a));
-        lx += 16.0 + cv.text(lx + 16.0, area.y + 12.0, 11.5, false, col(SUB, 1.0), t) + 14.0;
-    }
+    cv.blend(&over[1]);
+    cv.over = Some(over);
+}
+
+fn build_overlays(cv: &mut Canvas) -> [Layer; 2] {
+    let VisGeo { area, .. } = vis_geo();
+    let hit_y = area.y + area.h;
+    let glow = cv.layer(hit_y - 18.0, hit_y + 0.5, |cv| {
+        // hit line glow
+        let glow = vgrad(hit_y - 18.0, hit_y, col(ACCENT, 0.0), col(ACCENT, 0.35));
+        cv.rr_paint(area.x, hit_y - 18.0, area.w, 18.0, 0.0, &glow);
+        cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 0.9));
+    });
+    let top = cv.layer(area.y, area.y + 36.0, |cv| {
+        // soft fade where notes enter at the top
+        let fade = vgrad(area.y, area.y + 36.0, col(0x0A0D14, 1.0), col(0x0A0D14, 0.0));
+        cv.rr_paint(area.x, area.y, area.w, 36.0, 0.0, &fade);
+        // legend on a dark pill so notes never cover it
+        let lw: f32 = ["흰건반", "Shift", "Ctrl", "뺀 음"].iter().map(|t| cv.measure(11.5, false, t) + 30.0).sum::<f32>() + 6.0;
+        cv.rr(area.x + 8.0, area.y + 8.0, lw, 24.0, 12.0, col(0x0A0D14, 0.85));
+        let mut lx = area.x + 18.0;
+        for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
+            cv.rr(lx, area.y + 15.0, 10.0, 10.0, 3.0, col(c, a));
+            lx += 16.0 + cv.text(lx + 16.0, area.y + 12.0, 11.5, false, col(SUB, 1.0), t) + 14.0;
+        }
+    });
+    [glow, top]
 }
 
 fn transport(cv: &mut Canvas, m: &Model) {
@@ -838,7 +916,7 @@ fn transport(cv: &mut Canvas, m: &Model) {
     // times + seek bar
     let sb = seek_bar();
     let len = m.length_us();
-    let frac = if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 } as f32;
+    let frac = progress(m);
     cv.text_r(sb.x - 14.0, sb.y - 6.0, 13.0, true, col(TEXT, 1.0), &mmss(m.pos_us));
     cv.text(sb.x + sb.w + 14.0, sb.y - 6.0, 13.0, false, col(SUB, 1.0), &mmss(len));
     cv.rr(sb.x, sb.y, sb.w, sb.h, 4.0, col(0x252D3F, 1.0));
@@ -1013,5 +1091,43 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
         let x = c.x + 20.0 + i as f32 * cw;
         cv.text(x, by + 20.0, 11.0, false, col(DIM, 1.0), k);
         cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schedule::VisNote;
+
+    fn playing(vis: bool) -> Model {
+        let mut m = Model::default();
+        m.state = ST_PLAYING;
+        m.vis_on = vis;
+        m.set_vis(vec![VisNote { start: 0, end: 180_000_000, pitch: 60, kept: true }]);
+        m.summary = Some(Summary { length_us: 180_000_000, ok: true, ..Summary::default() });
+        m
+    }
+
+    #[test]
+    fn frame_key_without_visualizer_follows_shown_time_and_bar() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(false) }, 1.0);
+        // 3-minute song: a few ms moves neither the clock nor the bar
+        assert_eq!(at(10_000_000), at(10_005_000));
+        // the clock ticks over
+        assert_ne!(at(10_990_000), at(11_000_000));
+        // the bar moves by a visible amount
+        assert_ne!(at(10_000_000), at(10_900_000));
+    }
+
+    #[test]
+    fn frame_key_with_visualizer_changes_every_frame() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(true) }, 1.0);
+        assert_ne!(at(10_000_000), at(10_016_000));
+    }
+
+    #[test]
+    fn frame_key_shows_blocked_warning() {
+        let m = playing(false);
+        assert_ne!(frame_key(&m, 1.0), frame_key(&Model { blocked: true, ..playing(false) }, 1.0));
     }
 }
