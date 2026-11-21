@@ -2,25 +2,33 @@
 //! file dialog, drag & drop, background analysis. No extra runtime, no GPU.
 
 use crate::analyze;
+use crate::library::{self, Library};
 use crate::player;
 use crate::ui::{self, Canvas, Fonts, Model, Wid};
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    PAINTSTRUCT,
+    PAINTSTRUCT, ScreenToClient,
 };
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
-use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE,
+    BIF_RETURNONLYFSDIRS, BROWSEINFOW, HDROP,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_ANALYZED: u32 = WM_APP + 1;
@@ -32,6 +40,9 @@ struct App {
     model: Model,
     cv: Canvas,
     file: Option<String>,
+    lib: Library,
+    /// where the song list is saved (%APPDATA%\keyblox\songs.txt)
+    lib_path: Option<PathBuf>,
     gen: u64,
     tracking: bool,
     last_frame: (u8, i64, bool, Option<Wid>),
@@ -101,16 +112,63 @@ fn analyze_async(app: &mut App) {
     });
 }
 
+fn lib_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("keyblox").join("songs.txt"))
+}
+
+/// Re-read the song list (folders are rescanned) and mark the open file.
+fn refresh_songs(app: &mut App) {
+    let rows = app.lib.rows();
+    app.model.song_sel = app.file.as_ref().and_then(|f| rows.iter().position(|r| r.file.as_deref() == Some(Path::new(f))));
+    app.model.set_songs(rows);
+    app.dirty = true;
+}
+
+fn save_songs(app: &App) {
+    if let Some(p) = &app.lib_path {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = app.lib.save(p);
+    }
+}
+
+/// Add files/folders to the song list (MIDI files only). Returns the first file among them.
+fn add_songs(app: &mut App, paths: Vec<PathBuf>) -> Option<String> {
+    let mut first = None;
+    for p in paths {
+        let dir = p.is_dir();
+        if !dir && first.is_none() {
+            first = Some(p.to_string_lossy().into_owned());
+        }
+        if !dir && !library::is_midi(&p) {
+            continue; // still opened as before, just not listed
+        }
+        app.lib.add(p, dir);
+    }
+    save_songs(app);
+    refresh_songs(app);
+    first
+}
+
 fn open_file(app: &mut App, path: String) {
+    // keep every opened file in the list unless a linked folder already has it
+    let p = Path::new(&path);
+    if library::is_midi(p) && !app.model.songs.iter().any(|r| r.file.as_deref() == Some(p)) {
+        app.lib.add(PathBuf::from(&path), false);
+        save_songs(app);
+    }
     app.model.file_name = Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string());
     app.model.summary = None;
     app.model.set_vis(vec![]);
     app.file = Some(path);
+    refresh_songs(app);
     analyze_async(app);
 }
 
-fn pick_file(owner: HWND) -> Option<String> {
-    let mut buf = [0u16; 1024];
+/// File dialog; several files can be picked when `multi` is set.
+fn pick_files(owner: HWND, multi: bool) -> Vec<PathBuf> {
+    let mut buf = vec![0u16; if multi { 32 * 1024 } else { 1024 }];
     let filter: Vec<u16> = "MIDI 파일 (*.mid;*.midi)\0*.mid;*.midi\0모든 파일\0*.*\0\0".encode_utf16().collect();
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -118,12 +176,37 @@ fn pick_file(owner: HWND) -> Option<String> {
     ofn.lpstrFilter = filter.as_ptr();
     ofn.lpstrFile = buf.as_mut_ptr();
     ofn.nMaxFile = buf.len() as u32;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if unsafe { GetOpenFileNameW(&mut ofn) } != 0 {
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | if multi { OFN_ALLOWMULTISELECT | OFN_EXPLORER } else { 0 };
+    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+        return vec![];
+    }
+    // one file: "path\0\0"; several: "dir\0name1\0name2\0\0"
+    let parts: Vec<String> = buf.split(|&c| c == 0).take_while(|s| !s.is_empty()).map(String::from_utf16_lossy).collect();
+    match parts.as_slice() {
+        [] => vec![],
+        [one] => vec![PathBuf::from(one)],
+        [dir, names @ ..] => names.iter().map(|n| Path::new(dir).join(n)).collect(),
+    }
+}
+
+fn pick_folder(owner: HWND) -> Option<PathBuf> {
+    let title = w("연결할 MIDI 폴더를 고르세요");
+    let bi = BROWSEINFOW {
+        hwndOwner: owner,
+        lpszTitle: title.as_ptr(),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe {
+        let pidl = SHBrowseForFolderW(&bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0;
+        CoTaskMemFree(pidl as *const _);
         let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        Some(String::from_utf16_lossy(&buf[..n]))
-    } else {
-        None
+        (ok && n > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
     }
 }
 
@@ -147,9 +230,37 @@ fn click(hwnd: HWND, wid: Wid) {
     match wid {
         Wid::Open => {
             // modal dialog: must not hold the app borrow while it runs
-            if let Some(p) = pick_file(hwnd) {
-                with_app(|a| open_file(a, p));
+            if let Some(p) = pick_files(hwnd, false).pop() {
+                with_app(|a| open_file(a, p.to_string_lossy().into_owned()));
             }
+        }
+        Wid::AddFile => {
+            let files = pick_files(hwnd, true);
+            if !files.is_empty() {
+                with_app(|a| add_songs(a, files));
+            }
+        }
+        Wid::AddFolder => {
+            if let Some(d) = pick_folder(hwnd) {
+                with_app(|a| add_songs(a, vec![d]));
+            }
+        }
+        Wid::Song(i) => {
+            with_app(|a| {
+                if let Some(f) = a.model.songs.get(i as usize).and_then(|r| r.file.clone()) {
+                    open_file(a, f.to_string_lossy().into_owned());
+                }
+            });
+        }
+        Wid::SongDel(i) => {
+            with_app(|a| {
+                if let Some(e) = a.model.songs.get(i as usize).map(|r| r.entry) {
+                    a.lib.remove(e);
+                    save_songs(a);
+                    refresh_songs(a);
+                    a.model.hover = None;
+                }
+            });
         }
         Wid::Play => {
             with_app(|a| {
@@ -228,7 +339,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.tracking = true;
                 }
                 let (x, y) = mouse_xy(a, lp);
-                let h = ui::hit(x, y);
+                let h = ui::hit(&a.model, x, y);
                 if h != a.model.hover {
                     a.model.hover = h;
                     a.dirty = true;
@@ -250,7 +361,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             with_app(|a| {
                 let (x, y) = mouse_xy(a, lp);
-                a.model.pressed = ui::hit(x, y);
+                a.model.pressed = ui::hit(&a.model, x, y);
                 if a.model.pressed == Some(Wid::Seek) {
                     SetCapture(hwnd);
                     seek_to(a, x);
@@ -267,7 +378,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if p == Some(Wid::Seek) {
                     ReleaseCapture();
                     None
-                } else if p.is_some() && p == ui::hit(x, y) {
+                } else if p.is_some() && p == ui::hit(&a.model, x, y) {
                     p
                 } else {
                     None
@@ -289,14 +400,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DROPFILES => {
             let drop = wp as HDROP;
-            let mut buf = [0u16; 1024];
-            let n = DragQueryFileW(drop, 0, buf.as_mut_ptr(), buf.len() as u32) as usize;
-            DragFinish(drop);
-            if n > 0 {
-                let p = String::from_utf16_lossy(&buf[..n]);
-                with_app(|a| open_file(a, p));
+            let count = DragQueryFileW(drop, u32::MAX, null_mut(), 0);
+            let mut paths = vec![];
+            for i in 0..count {
+                let mut buf = [0u16; 1024];
+                let n = DragQueryFileW(drop, i, buf.as_mut_ptr(), buf.len() as u32) as usize;
+                if n > 0 {
+                    paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
+                }
             }
+            DragFinish(drop);
+            // dropped files and folders join the list; the first file is opened
+            with_app(|a| {
+                if let Some(f) = add_songs(a, paths) {
+                    open_file(a, f);
+                }
+            });
             0
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+            ScreenToClient(hwnd, &mut pt);
+            with_app(|a| {
+                let (x, y) = (pt.x as f32 / a.cv.s, pt.y as f32 / a.cv.s);
+                if ui::in_song_list(x, y) {
+                    a.model.scroll_songs(-delta * 3 / 120);
+                    a.model.hover = ui::hit(&a.model, x, y);
+                    a.dirty = true;
+                }
+            });
+            0
+        }
+        WM_ACTIVATE => {
+            // coming back to the app: pick up files added to linked folders
+            if (wp & 0xFFFF) as u32 != WA_INACTIVE {
+                with_app(refresh_songs);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_ANALYZED => {
             let done = DONE.lock().unwrap().take();
@@ -355,6 +496,10 @@ pub fn run(initial: Option<String>) {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    unsafe {
+        // the folder picker (SHBrowseForFolderW new-style) needs COM on this thread
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+    }
     player::init();
     let fonts = load_fonts();
     unsafe {
@@ -389,18 +534,23 @@ pub fn run(initial: Option<String>) {
         SetWindowPos(hwnd, null_mut(), 0, 0, ww, wh, SWP_NOMOVE | SWP_NOZORDER);
 
         player::set_own_window(hwnd as usize);
+        let lib_path = lib_path();
+        let lib = lib_path.as_deref().map(Library::load).unwrap_or_default();
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
                 model: Model::default(),
                 cv: Canvas::new(scale, fonts),
                 file: None,
+                lib,
+                lib_path,
                 gen: 0,
                 tracking: false,
                 last_frame: (255, -1, false, None),
                 dirty: true,
             })
         });
+        with_app(refresh_songs);
         DragAcceptFiles(hwnd, 1);
         SetTimer(hwnd, 1, 15, None);
         ShowWindow(hwnd, SW_SHOW);
