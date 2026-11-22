@@ -176,7 +176,7 @@ fn add_songs(app: &mut App, paths: Vec<PathBuf>) -> Option<String> {
 fn open_file(app: &mut App, path: String) {
     // keep every opened file in the list unless a linked folder already has it
     let p = Path::new(&path);
-    if library::is_midi(p) && !app.model.songs.iter().any(|r| r.file.as_deref() == Some(p)) {
+    if library::is_midi(p) && !app.lib.covers(p) {
         app.lib.add(PathBuf::from(&path), false);
         save_songs(app);
         refresh_songs(app);

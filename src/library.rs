@@ -96,6 +96,12 @@ impl Library {
         true
     }
 
+    /// Is `file` already in the list, directly or inside a linked folder?
+    /// (Checked against the entries, not the scanned rows, so it needs no scan.)
+    pub fn covers(&self, file: &Path) -> bool {
+        self.entries.iter().any(|e| e.path == file || (e.folder && file.starts_with(&e.path)))
+    }
+
     pub fn remove(&mut self, i: usize) {
         if i < self.entries.len() {
             self.entries.remove(i);
@@ -189,6 +195,17 @@ mod tests {
         assert_eq!(rows[0].file, Some(d.join("solo.mid")));
         assert_eq!(rows[1].file, None);
         assert_eq!(rows[4].file, Some(d.join("sub").join("c.midi")));
+    }
+
+    #[test]
+    fn covers_listed_files_and_anything_under_linked_folders() {
+        let mut lib = Library::default();
+        lib.add("songs/a.mid".into(), false);
+        lib.add("linked".into(), true);
+        assert!(lib.covers(Path::new("songs/a.mid")));
+        assert!(lib.covers(Path::new("linked/sub/b.mid")));
+        assert!(!lib.covers(Path::new("songs/b.mid")));
+        assert!(!lib.covers(Path::new("linked2/c.mid")));
     }
 
     #[test]
