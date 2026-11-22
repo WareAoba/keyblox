@@ -266,7 +266,7 @@ fn choose(notes: &[Note], p: Params) -> Vec<(usize, i64)> {
 /// chord of up to `count` notes still sounds full. When a moment must lose notes, its highest (melody) and
 /// lowest (bass) notes are kept first, then top-down.
 fn limit_rate(notes: &[Note], path: Vec<(usize, i64)>, count: usize, window: i64) -> Vec<(usize, i64)> {
-    if count == 0 || window <= 0 {
+    if count == 0 || window <= 0 || path.is_empty() {
         return path;
     }
     let mut recent: VecDeque<i64> = VecDeque::new();
@@ -689,6 +689,12 @@ mod tests {
         let count = |pt: u8| s.actions.iter().filter(|a| matches!(a.note, Some((q, _)) if q == pt)).count();
         assert!(count(72) >= count(55) && count(36) >= count(55));
         assert!(count(72) > 250, "melody kept nearly every time: {}", count(72));
+    }
+
+    #[test]
+    fn rate_limit_on_empty_song() {
+        let s = check(&[], Params { rate_count: 20, rate_window: 100_000, ..P });
+        assert_eq!(s.strikes, 0);
     }
 
     #[test]
