@@ -127,7 +127,12 @@ fn refresh_songs(app: &mut App) {
     let (gen, lib, hwnd) = (app.songs_gen, app.lib.clone(), app.hwnd as usize);
     std::thread::spawn(move || {
         let rows = lib.rows();
-        *SONGS.lock().unwrap() = Some((gen, rows));
+        // scans can finish out of order: never replace a newer pending result
+        let mut slot = SONGS.lock().unwrap();
+        if slot.as_ref().map_or(true, |(g, _)| *g < gen) {
+            *slot = Some((gen, rows));
+        }
+        drop(slot);
         unsafe {
             PostMessageW(hwnd as HWND, WM_SONGS, 0, 0);
         }
