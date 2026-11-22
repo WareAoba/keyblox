@@ -83,9 +83,9 @@ pub enum Wid {
     AddFile,
     AddFolder,
     /// a playable row in the song list (row index)
-    Song(u16),
+    Song(usize),
     /// the remove button of a file row or folder header (row index)
-    SongDel(u16),
+    SongDel(usize),
 }
 
 pub struct Model {
@@ -316,10 +316,10 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
     for (i, row) in m.songs.iter().enumerate() {
         let Some(r) = song_rect(m, i) else { continue };
         if row.kind != RowKind::InFolder {
-            v.push((song_del_rect(&r), Wid::SongDel(i as u16)));
+            v.push((song_del_rect(&r), Wid::SongDel(i)));
         }
         if row.file.is_some() {
-            v.push((r, Wid::Song(i as u16)));
+            v.push((r, Wid::Song(i)));
         }
     }
     let (px, py, pr) = play_btn();
@@ -733,7 +733,7 @@ fn song_list(cv: &mut Canvas, m: &Model) {
     }
     for (i, row) in m.songs.iter().enumerate() {
         let Some(r) = song_rect(m, i) else { continue };
-        let hov = matches!(m.hover, Some(Wid::Song(k) | Wid::SongDel(k)) if k as usize == i);
+        let hov = matches!(m.hover, Some(Wid::Song(k) | Wid::SongDel(k)) if k == i);
         let sel = m.song_sel == Some(i);
         if sel {
             cv.rr(r.x, r.y + 1.0, r.w, r.h - 2.0, 8.0, col(ACCENT, 0.22));
@@ -762,7 +762,7 @@ fn song_list(cv: &mut Canvas, m: &Model) {
         }
         if del {
             let d = song_del_rect(&r);
-            let on = m.hover == Some(Wid::SongDel(i as u16));
+            let on = m.hover == Some(Wid::SongDel(i));
             if on {
                 cv.rr(d.x, d.y, d.w, d.h, 6.0, col(RED, 0.18));
             }

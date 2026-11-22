@@ -30,7 +30,7 @@ pub enum RowKind {
     InFolder,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Library {
     pub entries: Vec<Entry>,
 }

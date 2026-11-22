@@ -65,7 +65,7 @@ fn main() {
             let rows = lib.rows();
             m.song_sel = rows.iter().position(|r| r.file.as_deref() == Some(std::path::Path::new(path)));
             m.set_songs(rows);
-            if let Some(h) = val("--hover-song") { m.hover = Some(ui::Wid::SongDel(h as u16)); }
+            if let Some(h) = val("--hover-song") { m.hover = Some(ui::Wid::SongDel(h as usize)); }
         }
         if args.iter().any(|a| a == "--novis") { m.vis_on = false; }
         let t0 = std::time::Instant::now();

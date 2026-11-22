@@ -32,6 +32,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_ANALYZED: u32 = WM_APP + 1;
+const WM_SONGS: u32 = WM_APP + 2;
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
@@ -44,6 +45,7 @@ struct App {
     /// where the song list is saved (%APPDATA%\keyblox\songs.txt)
     lib_path: Option<PathBuf>,
     gen: u64,
+    songs_gen: u64,
     tracking: bool,
     last_frame: (u8, i64, bool, Option<Wid>),
     dirty: bool,
@@ -58,6 +60,8 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 static DONE: Mutex<Option<Done>> = Mutex::new(None);
+/// latest folder scan result: (generation, rows)
+static SONGS: Mutex<Option<(u64, Vec<crate::library::Row>)>> = Mutex::new(None);
 
 fn w(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -116,11 +120,24 @@ fn lib_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("keyblox").join("songs.txt"))
 }
 
-/// Re-read the song list (folders are rescanned) and mark the open file.
+/// Rebuild the song rows on a worker thread (linked folders can be large or on
+/// a slow drive); the result arrives as WM_SONGS.
 fn refresh_songs(app: &mut App) {
-    let rows = app.lib.rows();
-    app.model.song_sel = app.file.as_ref().and_then(|f| rows.iter().position(|r| r.file.as_deref() == Some(Path::new(f))));
-    app.model.set_songs(rows);
+    app.songs_gen += 1;
+    let (gen, lib, hwnd) = (app.songs_gen, app.lib.clone(), app.hwnd as usize);
+    std::thread::spawn(move || {
+        let rows = lib.rows();
+        *SONGS.lock().unwrap() = Some((gen, rows));
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_SONGS, 0, 0);
+        }
+    });
+}
+
+/// Highlight the row of the open file.
+fn mark_open_song(app: &mut App) {
+    let f = app.file.as_deref().map(Path::new);
+    app.model.song_sel = f.and_then(|f| app.model.songs.iter().position(|r| r.file.as_deref() == Some(f)));
     app.dirty = true;
 }
 
@@ -157,12 +174,13 @@ fn open_file(app: &mut App, path: String) {
     if library::is_midi(p) && !app.model.songs.iter().any(|r| r.file.as_deref() == Some(p)) {
         app.lib.add(PathBuf::from(&path), false);
         save_songs(app);
+        refresh_songs(app);
     }
     app.model.file_name = Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string());
     app.model.summary = None;
     app.model.set_vis(vec![]);
     app.file = Some(path);
-    refresh_songs(app);
+    mark_open_song(app);
     analyze_async(app);
 }
 
@@ -247,16 +265,22 @@ fn click(hwnd: HWND, wid: Wid) {
         }
         Wid::Song(i) => {
             with_app(|a| {
-                if let Some(f) = a.model.songs.get(i as usize).and_then(|r| r.file.clone()) {
+                if let Some(f) = a.model.songs.get(i).and_then(|r| r.file.clone()) {
                     open_file(a, f.to_string_lossy().into_owned());
                 }
             });
         }
         Wid::SongDel(i) => {
             with_app(|a| {
-                if let Some(e) = a.model.songs.get(i as usize).map(|r| r.entry) {
+                if let Some(e) = a.model.songs.get(i).map(|r| r.entry) {
                     a.lib.remove(e);
                     save_songs(a);
+                    // drop its rows now so the list matches `lib` until the rescan lands
+                    let mut rows = std::mem::take(&mut a.model.songs);
+                    rows.retain(|r| r.entry != e);
+                    rows.iter_mut().filter(|r| r.entry > e).for_each(|r| r.entry -= 1);
+                    a.model.set_songs(rows);
+                    mark_open_song(a);
                     refresh_songs(a);
                     a.model.hover = None;
                 }
@@ -439,6 +463,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
+        WM_SONGS => {
+            let done = SONGS.lock().unwrap().take();
+            if let Some((gen, rows)) = done {
+                with_app(|a| {
+                    if gen == a.songs_gen {
+                        a.model.set_songs(rows);
+                        mark_open_song(a);
+                    }
+                });
+            }
+            0
+        }
         WM_ANALYZED => {
             let done = DONE.lock().unwrap().take();
             if let Some(done) = done {
@@ -545,6 +581,7 @@ pub fn run(initial: Option<String>) {
                 lib,
                 lib_path,
                 gen: 0,
+                songs_gen: 0,
                 tracking: false,
                 last_frame: (255, -1, false, None),
                 dirty: true,
