@@ -87,9 +87,10 @@ impl Library {
         std::fs::write(file, s)
     }
 
-    /// Add a file or folder. Returns false if it was already there.
+    /// Add a file or folder. Returns false if it was already there
+    /// (a file inside a linked folder counts as already there).
     pub fn add(&mut self, path: PathBuf, folder: bool) -> bool {
-        if self.entries.iter().any(|e| e.path == path) {
+        if self.entries.iter().any(|e| e.path == path) || (!folder && self.covers(&path)) {
             return false;
         }
         self.entries.push(Entry { path, folder });
@@ -206,6 +207,9 @@ mod tests {
         assert!(lib.covers(Path::new("linked/sub/b.mid")));
         assert!(!lib.covers(Path::new("songs/b.mid")));
         assert!(!lib.covers(Path::new("linked2/c.mid")));
+        // a file inside a linked folder is not added again on its own
+        assert!(!lib.add("linked/sub/b.mid".into(), false));
+        assert_eq!(lib.entries.len(), 2);
     }
 
     #[test]
