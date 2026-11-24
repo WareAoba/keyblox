@@ -388,18 +388,6 @@ fn solid(c: Color) -> Paint<'static> {
     Paint { shader: Shader::SolidColor(c), anti_alias: true, ..Paint::default() }
 }
 
-fn vgrad(y0: f32, y1: f32, c0: Color, c1: Color) -> Paint<'static> {
-    let sh = LinearGradient::new(
-        Point::from_xy(0.0, y0),
-        Point::from_xy(0.0, y1),
-        vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or(Shader::SolidColor(c0));
-    Paint { shader: sh, anti_alias: true, ..Paint::default() }
-}
-
 fn hgrad(x0: f32, x1: f32, c0: Color, c1: Color) -> Paint<'static> {
     let sh = LinearGradient::new(
         Point::from_xy(x0, 0.0),
@@ -695,33 +683,44 @@ fn ellipsize(cv: &mut Canvas, s: &str, size: f32, max: f32) -> String {
 }
 
 struct VisGeo {
+    /// legend strip above the lanes (static, notes never reach it)
+    legend: R,
     area: R,
     kb: R,
 }
+const LANE_BG: u32 = 0x0C1019;
 fn vis_geo() -> VisGeo {
     let c = VIS_CARD;
     let inner = R::new(c.x + 12.0, c.y + 12.0, c.w - 24.0, c.h - 24.0);
     let kb_h = 92.0;
+    let leg_h = 24.0;
+    let top = inner.y + leg_h + 6.0;
     VisGeo {
+        legend: R::new(inner.x, inner.y, inner.w, leg_h),
         kb: R::new(inner.x, inner.y + inner.h - kb_h, inner.w, kb_h),
-        area: R::new(inner.x, inner.y, inner.w, inner.h - kb_h - 4.0),
+        area: R::new(inner.x, top, inner.w, inner.y + inner.h - kb_h - 4.0 - top),
     }
 }
 
+// Keys are plain rectangles so a lit key is one flat fill over the cached one.
 fn white_key(cv: &mut Canvas, p: u8, kb: &R, c: Color) {
     let (x, w) = key_x(p, kb);
-    cv.rr(x + 0.5, kb.y, w - 1.0, kb.h, 4.0, c);
+    cv.rect(x + 0.5, kb.y, w - 1.0, kb.h, c);
 }
 fn black_key(cv: &mut Canvas, p: u8, kb: &R, c: Color) {
     let (x, w) = key_x(p, kb);
-    cv.rr(x, kb.y - 1.0, w, kb.h * 0.62, 3.0, c);
+    cv.rect(x, kb.y - 1.0, w, kb.h * 0.62, c);
 }
 
 fn visualizer_static(cv: &mut Canvas, _m: &Model) {
     card(cv, VIS_CARD);
-    let VisGeo { area, kb } = vis_geo();
-    let bgp = vgrad(area.y, area.y + area.h, col(0x0A0D14, 1.0), col(0x0F1320, 1.0));
-    cv.rr_paint(area.x, area.y, area.w, area.h + 4.0, 10.0, &bgp);
+    let VisGeo { legend, area, kb } = vis_geo();
+    let mut lx = legend.x + 4.0;
+    for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
+        cv.rr(lx, legend.cy() - 5.0, 10.0, 10.0, 3.0, col(c, a));
+        lx += 16.0 + cv.text(lx + 16.0, legend.cy() - 8.5, 11.5, false, col(SUB, 1.0), t) + 14.0;
+    }
+    cv.rr(area.x, area.y, area.w, area.h + 4.0, 10.0, col(LANE_BG, 1.0));
     for p in 21..=108u8 {
         if !is_black(p) {
             white_key(cv, p, &kb, col(0xE9EDF3, 1.0));
@@ -741,7 +740,7 @@ fn visualizer_static(cv: &mut Canvas, _m: &Model) {
 /// Lane background region that the notes are drawn over (restored from the
 /// static layer every frame, so only notes / lit keys / glow are drawn here).
 fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
-    let VisGeo { area, kb } = vis_geo();
+    let VisGeo { area, kb, .. } = vis_geo();
     for p in (24..=108).step_by(12) {
         let (x, _) = key_x(p, &kb);
         cv.rect(x, area.y + 6.0, 1.0, area.h - 6.0, col(0xFFFFFF, 0.045));
@@ -752,12 +751,10 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
     let mut lit: [Option<u32>; 128] = [None; 128];
 
     if m.vis_on && !m.vis.is_empty() {
-        let v = m.vis.clone();
+        let v = &m.vis;
         let lo = v.partition_point(|n| n.start < now - m.vis_maxdur);
         let hi = v.partition_point(|n| (n.start as f64) < now as f64 + LOOKAHEAD_US);
         let visible = &v[lo..hi];
-        let kept_n = visible.iter().filter(|n| n.kept && n.end >= now).count();
-        let fancy = kept_n < 400; // rounded, shaded notes unless the screen is flooded
         // removed notes: faint ghosts
         for n in visible.iter().filter(|n| !n.kept && n.end >= now) {
             let (x, w) = key_x(n.pitch, &kb);
@@ -783,22 +780,15 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
                 if n.start <= now && now < n.end.max(n.start + 60_000) {
                     lit[n.pitch as usize] = Some(nc);
                 }
+                // flat fill; the 1px gap at the top keeps repeated notes apart
                 let h = (yb - yt).max(4.0);
-                if fancy {
-                    let p = vgrad(yt, yb, col(nc, 0.78), col(nc, 1.0));
-                    cv.rr_paint(x + 1.5, yt, w - 3.0, h, 4.0, &p);
-                } else {
-                    cv.rect(x + 1.5, yt, w - 3.0, h, col(nc, 0.95));
-                    cv.rect(x + 1.5, yt, w - 3.0, h.min(2.0), col(0xFFFFFF, 0.35));
-                }
+                cv.rect(x + 1.5, yt + 1.0, w - 3.0, h - 1.0, col(nc, 1.0));
             }
         }
     }
 
-    // hit line glow
-    let glow = vgrad(hit_y - 18.0, hit_y, col(ACCENT, 0.0), col(ACCENT, 0.35));
-    cv.rr_paint(area.x, hit_y - 18.0, area.w, 18.0, 0.0, &glow);
-    cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 0.9));
+    // hit line
+    cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 1.0));
 
     // lit keys over the cached keyboard
     let mut redraw_black = [false; 128];
@@ -835,17 +825,6 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
     } else if m.analyzing {
         cv.rr(area.cx() - 70.0, area.y + 16.0, 140.0, 30.0, 15.0, col(CARD2, 0.95));
         cv.text_c(area.cx(), area.y + 31.0, 13.0, false, col(TEXT, 1.0), "다시 분석 중…");
-    }
-    // soft fade where notes enter at the top
-    let fade = vgrad(area.y, area.y + 36.0, col(0x0A0D14, 1.0), col(0x0A0D14, 0.0));
-    cv.rr_paint(area.x, area.y, area.w, 36.0, 0.0, &fade);
-    // legend on a dark pill so notes never cover it
-    let lw: f32 = ["흰건반", "Shift", "Ctrl", "뺀 음"].iter().map(|t| cv.measure(11.5, false, t) + 30.0).sum::<f32>() + 6.0;
-    cv.rr(area.x + 8.0, area.y + 8.0, lw, 24.0, 12.0, col(0x0A0D14, 0.85));
-    let mut lx = area.x + 18.0;
-    for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
-        cv.rr(lx, area.y + 15.0, 10.0, 10.0, 3.0, col(c, a));
-        lx += 16.0 + cv.text(lx + 16.0, area.y + 12.0, 11.5, false, col(SUB, 1.0), t) + 14.0;
     }
 }
 
