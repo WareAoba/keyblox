@@ -88,6 +88,16 @@ pub enum Wid {
     Song(usize),
     /// the remove button of a file row or folder header (row index)
     SongDel(usize),
+    /// the value box of settings row `i` (type a value)
+    Field(usize),
+}
+
+/// A settings value being typed into.
+pub struct Edit {
+    pub row: usize,
+    pub text: String,
+    /// the whole text is selected: the next character replaces it
+    pub fresh: bool,
 }
 
 pub struct Model {
@@ -122,6 +132,7 @@ pub struct Model {
     pub song_sel: Option<usize>,
     /// first visible row
     pub song_scroll: usize,
+    pub edit: Option<Edit>,
 }
 
 impl Default for Model {
@@ -152,6 +163,7 @@ impl Default for Model {
             songs_ver: 0,
             song_sel: None,
             song_scroll: 0,
+            edit: None,
         }
     }
 }
@@ -228,12 +240,93 @@ impl Model {
             }
             _ => return false,
         }
+        self.clamp_settings();
+        true
+    }
+    fn clamp_settings(&mut self) {
         self.speed = self.speed.clamp(0.25, 3.0);
         self.transpose = self.transpose.clamp(-24, 24);
         self.tol_ms = self.tol_ms.map(|t| t.clamp(0, 150));
         self.rate = self.rate.clamp(0, 200);
         self.rate_win_ms = self.rate_win_ms.clamp(10, 1000);
-        true
+    }
+    /// Open settings row `row` for typing, its current value selected.
+    pub fn begin_edit(&mut self, row: usize) {
+        if !self.editable() {
+            return;
+        }
+        let text = match row {
+            0 => match self.base_bpm() {
+                Some(b) => bpm_text(b * self.speed),
+                None => format!("{:.2}", self.speed),
+            },
+            1 => self.transpose.to_string(),
+            2 => self.tol_ms.map(|t| t.to_string()).unwrap_or_default(),
+            3 => self.rate.to_string(),
+            4 => self.rate_win_ms.to_string(),
+            _ => self.human.to_string(),
+        };
+        self.edit = Some(Edit { row, text, fresh: true });
+    }
+    pub fn edit_char(&mut self, c: char) {
+        if let Some(e) = &mut self.edit {
+            if !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')) {
+                return;
+            }
+            if e.fresh {
+                e.text.clear();
+                e.fresh = false;
+            }
+            if e.text.len() < 7 {
+                e.text.push(c);
+            }
+        }
+    }
+    pub fn edit_backspace(&mut self) {
+        if let Some(e) = &mut self.edit {
+            if e.fresh {
+                e.text.clear();
+            }
+            e.text.pop();
+            e.fresh = false;
+        }
+    }
+    pub fn cancel_edit(&mut self) {
+        self.edit = None;
+    }
+    /// Apply the typed value (clamped to the row's range). Returns true if
+    /// analysis settings changed; text that is not a number changes nothing.
+    pub fn commit_edit(&mut self) -> bool {
+        let Some(e) = self.edit.take() else { return false };
+        if !self.editable() {
+            return false;
+        }
+        let t = e.text.trim();
+        let before = (self.speed, self.transpose, self.tol_ms, self.rate, self.rate_win_ms, self.human);
+        if e.row == 2 && t.is_empty() {
+            self.tol_ms = None; // empty = automatic
+        } else {
+            let Ok(v) = t.parse::<f64>() else { return false };
+            if !v.is_finite() {
+                return false;
+            }
+            let n = v.round().clamp(-10_000.0, 10_000.0) as i32;
+            match e.row {
+                0 => {
+                    self.speed = match self.base_bpm() {
+                        Some(b) => v / b,
+                        None => (v * 100.0).round() / 100.0,
+                    }
+                }
+                1 => self.transpose = n,
+                2 => self.tol_ms = Some(n),
+                3 => self.rate = n,
+                4 => self.rate_win_ms = n,
+                _ => self.human = n.clamp(0, crate::humanize::LEVEL_NAMES.len() as i32 - 1) as u8,
+            }
+            self.clamp_settings();
+        }
+        before != (self.speed, self.transpose, self.tol_ms, self.rate, self.rate_win_ms, self.human)
     }
     /// A different song was opened: speed/tempo is kept per song only.
     pub fn open_song(&mut self, name: String) {
@@ -265,6 +358,17 @@ impl Model {
     pub fn length_us(&self) -> i64 {
         self.summary.as_ref().map(|s| s.length_us).unwrap_or(0)
     }
+}
+
+/// Hold-to-repeat timing for the -/+ buttons: given when the previous step
+/// fired (ms since press, 0 = the press itself), when the next one fires.
+/// Waits 400 ms, then repeats every 120 ms, speeding up to 30 ms over 2 s.
+pub fn next_repeat(prev_ms: u64) -> u64 {
+    if prev_ms < 400 {
+        return 400;
+    }
+    let t = (prev_ms - 400).min(2000);
+    prev_ms + 120 - 90 * t / 2000
 }
 
 fn bpm_text(b: f64) -> String {
@@ -327,7 +431,11 @@ fn seek_bar() -> R {
 fn stepper_rects(row: usize) -> (R, R) {
     let y = ROW0 + row as f32 * ROW_H + 6.0;
     let right = SET_CARD.x + SET_CARD.w - 18.0;
-    (R::new(right - 124.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
+    (R::new(right - 140.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
+}
+fn field_rect(row: usize) -> R {
+    let (a, b) = stepper_rects(row);
+    R::new(a.x + a.w + 4.0, a.y, b.x - a.x - a.w - 8.0, a.h)
 }
 fn list_rows() -> usize {
     (LIST.h / LIST_ROW_H) as usize
@@ -373,12 +481,19 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
     for (i, (dn, up)) in pairs.iter().enumerate() {
         let (a, b) = stepper_rects(i);
         v.push((a, *dn));
+        v.push((field_rect(i), Wid::Field(i)));
         v.push((b, *up));
     }
     for (i, w) in [Wid::Pedal, Wid::Drums, Wid::Roblox, Wid::Vis].iter().enumerate() {
         v.push((toggle_row(i), *w));
     }
     v
+}
+
+/// The -/+ buttons of the settings rows.
+pub fn is_stepper(w: Wid) -> bool {
+    use Wid::*;
+    matches!(w, SpeedDn | SpeedUp | TransDn | TransUp | TolDn | TolUp | RateDn | RateUp | WinDn | WinUp | HumanDn | HumanUp)
 }
 
 pub fn in_song_list(x: f32, y: f32) -> bool {
@@ -1115,13 +1230,36 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         let (a, b) = stepper_rects(i);
         for (r, w, minus) in [(a, *dn, true), (b, *up, false)] {
             let hov = m.hover == Some(w) && ed;
-            cv.rr(r.x, r.y, r.w, r.h, 9.0, col(if hov { 0x283044 } else { CARD2 }, 1.0));
+            let bg = if m.pressed == Some(w) && ed { 0x343E58 } else if hov { 0x283044 } else { CARD2 };
+            cv.rr(r.x, r.y, r.w, r.h, 9.0, col(bg, 1.0));
             cv.rr(r.cx() - 5.5, r.cy() - 0.9, 11.0, 1.8, 0.9, col(TEXT, la));
             if !minus {
                 cv.rr(r.cx() - 0.9, r.cy() - 5.5, 1.8, 11.0, 0.9, col(TEXT, la));
             }
         }
-        cv.text_c((a.x + a.w + b.x) / 2.0, a.cy() + 1.0, 13.5, true, col(TEXT, la), val);
+        let f = field_rect(i);
+        let edit = m.edit.as_ref().filter(|e| e.row == i);
+        let line = match edit {
+            Some(_) => col(ACCENT, 1.0),
+            None if m.hover == Some(Wid::Field(i)) && ed => col(0x3A4560, 1.0),
+            None => col(BORDER, 1.0),
+        };
+        cv.rr(f.x, f.y, f.w, f.h, 7.0, col(BG, 1.0));
+        cv.rr_stroke(f.x + 0.5, f.y + 0.5, f.w - 1.0, f.h - 1.0, 6.5, line, 1.0);
+        match edit {
+            Some(e) => {
+                let tw = cv.measure(13.5, true, &e.text);
+                let tx = f.cx() - tw / 2.0;
+                if e.fresh && !e.text.is_empty() {
+                    cv.rr(tx - 2.0, f.y + 6.0, tw + 4.0, f.h - 12.0, 3.0, col(ACCENT, 0.45));
+                }
+                cv.text_c(f.cx(), f.cy() + 1.0, 13.5, true, col(TEXT, 1.0), &e.text);
+                if !e.fresh {
+                    cv.rect(tx + tw + 1.0, f.y + 7.0, 1.5, f.h - 14.0, col(TEXT, 1.0));
+                }
+            }
+            None => cv.text_c(f.cx(), f.cy() + 1.0, 13.5, true, col(TEXT, la), val),
+        }
     }
 
     // divider + toggles
@@ -1301,5 +1439,87 @@ mod tests {
         // a shorter list pulls the scroll back
         m.set_songs(rows(3));
         assert_eq!(m.song_scroll, 0);
+    }
+
+    #[test]
+    fn hold_repeat_waits_then_speeds_up() {
+        let at: Vec<u64> = std::iter::successors(Some(0), |&t| Some(next_repeat(t))).take(40).collect();
+        assert_eq!(at[1], 400);
+        let gaps: Vec<u64> = at.windows(2).skip(1).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] <= g[0]), "{gaps:?}");
+        assert!(gaps[0] >= 100 && *gaps.last().unwrap() <= 30, "{gaps:?}");
+    }
+
+    fn typed(m: &mut Model, row: usize, s: &str) -> bool {
+        m.begin_edit(row);
+        s.chars().for_each(|c| m.edit_char(c));
+        m.commit_edit()
+    }
+
+    #[test]
+    fn edit_opens_with_value_selected_and_typing_replaces_it() {
+        let mut m = Model::default();
+        m.begin_edit(3);
+        let e = m.edit.as_ref().unwrap();
+        assert_eq!((e.text.as_str(), e.fresh), ("20", true));
+        m.edit_char('5');
+        assert_eq!(m.edit.as_ref().unwrap().text, "5");
+        m.edit_backspace();
+        m.edit_char('4');
+        m.edit_char('0');
+        assert!(m.commit_edit());
+        assert_eq!(m.rate, 40);
+        assert!(m.edit.is_none());
+    }
+
+    #[test]
+    fn typed_values_are_clamped_to_each_range() {
+        let mut m = Model::default();
+        assert!(typed(&mut m, 1, "-30"));
+        assert_eq!(m.transpose, -24);
+        typed(&mut m, 4, "5000");
+        assert_eq!(m.rate_win_ms, 1000);
+        typed(&mut m, 2, "999");
+        assert_eq!(m.tol_ms, Some(150));
+        typed(&mut m, 5, "7");
+        assert_eq!(m.human, 3);
+        typed(&mut m, 0, "1.5");
+        assert_eq!(m.speed, 1.5);
+        typed(&mut m, 0, "9");
+        assert_eq!(m.speed, 3.0);
+    }
+
+    #[test]
+    fn typed_tempo_is_in_bpm_and_empty_tolerance_is_automatic() {
+        let mut m = Model::default();
+        m.summary = Some(Summary { bpm: Some(120.0), ..Summary::default() });
+        assert!(typed(&mut m, 0, "150"));
+        assert_eq!(m.speed_text(), "150 BPM");
+        m.tol_ms = Some(30);
+        m.begin_edit(2);
+        m.edit_backspace();
+        assert!(m.commit_edit());
+        assert_eq!(m.tol_ms, None);
+    }
+
+    #[test]
+    fn bad_or_unchanged_input_changes_nothing() {
+        let mut m = Model::default();
+        assert!(!typed(&mut m, 3, "abc"));
+        assert!(!typed(&mut m, 3, "-"));
+        assert!(!typed(&mut m, 3, "20"));
+        assert_eq!(m.rate, 20);
+        m.begin_edit(3);
+        m.edit_char('9');
+        m.cancel_edit();
+        assert_eq!(m.rate, 20);
+        assert!(m.edit.is_none());
+    }
+
+    #[test]
+    fn no_edit_while_playing() {
+        let mut m = playing(false);
+        m.begin_edit(3);
+        assert!(m.edit.is_none());
     }
 }
