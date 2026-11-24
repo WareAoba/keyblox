@@ -47,8 +47,8 @@ pub const COALESCE_US: i64 = 1_000;
 /// frame jitter) plus the player's coalescing window.
 pub const DWELL_US: i64 = 20_833 + COALESCE_US;
 
-/// DWELL for a game running at `fps` (same rule as DWELL_US: 1.25 frames
-/// plus the coalescing window). Used only by the KEYBLOX_FPS experiment.
+/// DWELL for a game running at `fps`: same rule as DWELL_US (1.25 frames
+/// plus the coalescing window).
 pub fn dwell_for_fps(fps: f64) -> i64 {
     (1_000_000.0 / fps * 1.25).round() as i64 + COALESCE_US
 }
@@ -616,11 +616,11 @@ mod tests {
         assert!(d - COALESCE_US > 1_000_000 / 60, "dwell {d}us");
     }
 
-    /// The fps experiment uses the same rule as the fixed default.
+    /// A higher frame rate shortens the wait, but it still covers one frame.
     #[test]
     fn dwell_for_fps_matches_the_default_rule() {
         assert!((dwell_for_fps(60.0) - DWELL_US).abs() <= 1);
-        for fps in [120.0, 144.0, 240.0] {
+        for fps in [120.0, 144.0, 165.0, 240.0] {
             let d = dwell_for_fps(fps);
             assert!(d - COALESCE_US > (1e6 / fps) as i64 && d < DWELL_US, "{fps}: {d}");
         }

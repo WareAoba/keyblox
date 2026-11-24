@@ -52,6 +52,7 @@ fn main() {
         let mut cv = ui::Canvas::new(scale, fonts);
         let mut m = ui::Model::default();
         if let Some(h) = val("--human") { m.human = h as u8; }
+        if let Some(f) = val("--fps") { m.fps_idx = ui::FPS_CHOICES.iter().position(|&x| x as f64 == f).unwrap_or(0); }
         let a = analyze::analyze(&bytes, &m.settings()).unwrap();
         if !args.iter().any(|a| a == "--empty") {
             m.file_name = Some(path.rsplit('/').next().unwrap().to_string());
