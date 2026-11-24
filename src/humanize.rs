@@ -239,7 +239,7 @@ mod tests {
     fn doubled_notes_stay_merged() {
         // the same pitch from two tracks at one instant is struck once, as without humanize
         let ev = sorted(vec![on(0, 60), on(0, 64), on(0, 67), on(0, 67), off(400_000, 60), off(400_000, 64), off(400_000, 67), off(400_000, 67)]);
-        let p = schedule::Params::from_fps(60.0);
+        let p = schedule::Params::default();
         let s = schedule::build(&apply(&ev, H), p);
         assert_eq!((s.strikes, s.merged), (3, 1));
     }
@@ -266,7 +266,7 @@ mod tests {
             }
             let h = level(1 + (round % 3) as u8).unwrap();
             let hv = apply(&sorted(v), h);
-            let p = schedule::Params::from_fps(60.0);
+            let p = schedule::Params::default();
             let s = schedule::build(&hv, p);
             schedule::verify(&s.actions, p).unwrap();
             assert!(s.max_late <= p.tolerance);

@@ -23,14 +23,14 @@ fn main() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: keyblox <file.mid> [--fps N] [--tol MS] [--rate N] [--human 0-3] [--dump-ons]");
+        eprintln!("usage: keyblox <file.mid> [--tol MS] [--rate N] [--window MS] [--human 0-3] [--dump-ons]");
         std::process::exit(1);
     };
     let mut st = analyze::Settings::default();
     let val = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
-    if let Some(f) = val("--fps") { st.fps = f; }
     if let Some(t) = val("--tol") { st.tolerance = Some(t); }
-    if let Some(r) = val("--rate") { st.max_rate = Some(r); }
+    if let Some(r) = val("--rate") { st.rate_count = Some(r.max(0.0) as usize); }
+    if let Some(w) = val("--window") { st.rate_window = Some(w); }
     if let Some(h) = val("--human") { st.human = h as u8; }
     let bytes = std::fs::read(path).expect("read");
     if args.iter().any(|a| a == "--dump-acts") {
@@ -50,7 +50,6 @@ fn main() {
         let fonts = ui::Fonts::load(&reg, 1, &bold, 1).unwrap();
         let mut cv = ui::Canvas::new(scale, fonts);
         let mut m = ui::Model::default();
-        if let Some(f) = val("--fps") { m.fps_idx = ui::FPS_CHOICES.iter().position(|&x| x == f).unwrap_or(0); }
         if let Some(h) = val("--human") { m.human = h as u8; }
         let a = analyze::analyze(&bytes, &m.settings()).unwrap();
         if !args.iter().any(|a| a == "--empty") {
