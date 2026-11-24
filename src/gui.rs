@@ -102,9 +102,7 @@ fn analyze_async(app: &mut App) {
 }
 
 fn open_file(app: &mut App, path: String) {
-    app.model.file_name = Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string());
-    app.model.summary = None;
-    app.model.set_vis(vec![]);
+    app.model.open_song(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string());
     app.file = Some(path);
     analyze_async(app);
 }
