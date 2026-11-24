@@ -13,10 +13,11 @@
 //! - Note lengths are kept, except that a note which ended by the next moment
 //!   still ends by that moment's new start (released before its Shift/Ctrl
 //!   switch); pedal events are not moved.
-//! - Rubato: the song is cut into 3-8 s stretches; in each the tempo drifts
-//!   gradually up or down to `rubato` (fraction) and then snaps back over the
-//!   last fifth. Expressive piano timing varies by about 10% (eighth-note IOI
-//!   sd 9.5% in Timmers et al. 2003); "strong" uses that, lower levels less.
+//! - Rubato follows the music: slower where notes are dense, faster where
+//!   sparse, and each phrase pushes on in its middle, slows into its end and
+//!   starts the next one back in tempo (see `rubato`). Bounded by `rubato`
+//!   (fraction); "strong" uses 10%, about the eighth-note IOI sd of 9.5% in
+//!   Timmers et al. 2003.
 //! - Slips: notes in hard spots (fast notes in one hand, big leaps, inner chord
 //!   voices) sometimes go wrong: left out, a neighbouring key grazed as well, or
 //!   the neighbouring key instead (split about 43/39/18%, as in Flossmann &
@@ -97,39 +98,126 @@ fn sorted(mut v: Vec<Ev>) -> Vec<Ev> {
     v
 }
 
-/// Time warp: in each stretch the rate of time drifts linearly from 1 to 1+e
-/// (e = ±amount) over the first 4/5, then back to 1 over the last 1/5.
-/// Always increasing, so event order is kept.
+/// A gap this long between notes ends a phrase.
+fn rest_cap(med_ioi: f64) -> i64 {
+    (med_ioi * 4.0).max(600_000.0) as i64
+}
+
+/// Time warp driven by the music: a local tempo deviation `e` (positive =
+/// slower) is set at each moment and the clock runs at 1+e between moments.
+/// - Density: where many more notes come than usual for the song, the player
+///   slows down; where few come, they press on (speed/accuracy trade-off;
+///   Cancino-Chacon & Grachten 2018 find performers slow down to bring out
+///   dense melodic/harmonic events). 4x the song's median density = full `amount`.
+/// - Phrase arch: a phrase (notes between rests) starts in tempo, pushes ahead
+///   towards just past its middle and slows into its end, then the next phrase
+///   is back in tempo at once (Demos et al. 2016: slower at phrase starts and
+///   ends, fastest just after halfway).
+/// Sizes are bounded by `amount`; the split between the two parts is our choice.
 fn rubato(events: &[Ev], amount: f64) -> Vec<Ev> {
-    let end = events.last().map(|e| e.t).unwrap_or(0);
-    if amount <= 0.0 || end <= 0 {
+    if amount <= 0.0 {
         return events.to_vec();
     }
-    let mut rng = Rng(SEED ^ 0x7275_6261_746F);
-    // (start, length, e) per stretch, and the warped time at each start
-    let mut segs: Vec<(f64, f64, f64, f64)> = vec![];
-    let (mut t, mut w) = (0.0f64, 0.0f64);
-    while t <= end as f64 {
-        let len = 3e6 + 5e6 * rng.unit();
-        let e = amount * (0.5 + 0.5 * rng.unit()) * if rng.next() & 1 == 0 { 1.0 } else { -1.0 };
-        segs.push((t, len, e, w));
-        w += len + e * len / 2.0; // area of the triangle-shaped drift
-        t += len;
+    // moments: (time, notes)
+    let mut mo: Vec<(i64, usize)> = vec![];
+    for e in events {
+        if let Kind::NoteOn(_) = e.kind {
+            match mo.last_mut() {
+                Some(m) if e.t - m.0 <= CHORD_US => m.1 += 1,
+                _ => mo.push((e.t, 1)),
+            }
+        }
     }
-    const RISE: f64 = 0.8;
-    let warp = |x: i64| -> i64 {
-        let x = x as f64;
-        let k = segs.partition_point(|s| s.0 <= x).saturating_sub(1);
-        let (s0, len, e, w0) = segs[k];
-        let u = x - s0;
-        let up = RISE * len;
-        let extra = if u <= up {
-            e * u * u / (2.0 * up)
+    if mo.len() < 3 {
+        return events.to_vec();
+    }
+    let n = mo.len();
+    let mut iois: Vec<i64> = mo.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    iois.sort();
+    let med_ioi = iois[iois.len() / 2].max(1_000) as f64;
+
+    // density (notes per second) around each moment, over sounding time only
+    const WIN: i64 = 750_000;
+    let dens: Vec<f64> = (0..n)
+        .map(|k| {
+            let a = mo.partition_point(|m| m.0 < mo[k].0 - WIN);
+            let b = mo.partition_point(|m| m.0 <= mo[k].0 + WIN);
+            let notes: usize = mo[a..b].iter().map(|m| m.1).sum();
+            notes as f64 / ((mo[b - 1].0 - mo[a].0) as f64 + med_ioi) * 1e6
+        })
+        .collect();
+    // the song's usual density: median over time (each moment weighted by its step)
+    let mut wd: Vec<(f64, i64)> = (0..n).map(|k| (dens[k], mo.get(k + 1).map(|m| m.0 - mo[k].0).unwrap_or(0).min(rest_cap(med_ioi)))).collect();
+    wd.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+    let half = wd.iter().map(|x| x.1).sum::<i64>() / 2;
+    let mut acc = 0;
+    let med_d = wd.iter().find(|x| { acc += x.1; acc >= half }).unwrap().0;
+    let raw: Vec<f64> = dens.iter().map(|d| (amount * (d / med_d).ln() / 4f64.ln()).clamp(-amount, amount)).collect();
+    // gradual: average over +-1 s
+    let e_dens: Vec<f64> = (0..n)
+        .map(|k| {
+            let a = mo.partition_point(|m| m.0 < mo[k].0 - 1_000_000);
+            let b = mo.partition_point(|m| m.0 <= mo[k].0 + 1_000_000);
+            raw[a..b].iter().sum::<f64>() / (b - a) as f64
+        })
+        .collect();
+
+    // phrases: split at rests of 4x the usual step (at least 0.6 s), and long
+    // stretches without rests at their biggest step every 4-8 s
+    let rest = rest_cap(med_ioi);
+    let mut ends = vec![false; n];
+    let mut s0 = 0;
+    for k in 0..n {
+        if k + 1 == n || mo[k + 1].0 - mo[k].0 >= rest {
+            ends[k] = true;
+            s0 = k + 1;
+        } else if mo[k + 1].0 - mo[s0].0 > 8_000_000 {
+            let a = mo.partition_point(|m| m.0 < mo[s0].0 + 4_000_000).max(s0);
+            let cut = (a..=k).max_by_key(|&j| (mo[j + 1].0 - mo[j].0, j)).unwrap();
+            ends[cut] = true;
+            s0 = cut + 1;
+        }
+    }
+    let mut rng = Rng(SEED ^ 0x7275_6261_746F);
+    let mut e = vec![0.0f64; n];
+    let mut s0 = 0;
+    for k in 0..n {
+        if ends[k] {
+            let (t0, t1) = (mo[s0].0 as f64, mo[k].0 as f64);
+            let len = t1 - t0;
+            // short phrases get a smaller arch; a little variety between phrases
+            let arch = amount * 0.4 * (len / 3e6).min(1.0) * (0.7 + 0.6 * rng.unit());
+            for j in s0..=k {
+                let x = if len > 0.0 { (mo[j].0 as f64 - t0) / len } else { 0.0 };
+                let push = -(std::f64::consts::PI * x.powf(1.16)).sin(); // fastest at x ~ 0.55
+                let ritard = if x > 0.85 { ((x - 0.85) / 0.15).powi(2) * 1.5 } else { 0.0 };
+                e[j] = (e_dens[j] + arch * (push + ritard)).clamp(-amount, amount);
+            }
+            e[s0] = e_dens[s0].clamp(-amount, amount); // back in tempo at once
+            s0 = k + 1;
+        }
+    }
+
+    // warped time of each moment; the clock runs at 1+e, e linear between moments
+    let mut w = vec![mo[0].0 as f64; n];
+    for k in 1..n {
+        let d = (mo[k].0 - mo[k - 1].0) as f64;
+        w[k] = w[k - 1] + d * (1.0 + (e[k - 1] + e[k]) / 2.0);
+    }
+    let warp = |t: i64| -> i64 {
+        let k = mo.partition_point(|m| m.0 <= t);
+        if k == 0 {
+            return t;
+        }
+        let k = k - 1;
+        let u = (t - mo[k].0) as f64;
+        let x = if k + 1 < n {
+            let d = (mo[k + 1].0 - mo[k].0) as f64;
+            w[k] + u * (1.0 + e[k] + (e[k + 1] - e[k]) * u / (2.0 * d))
         } else {
-            let v = u - up;
-            e * up / 2.0 + e * (v - v * v / (2.0 * (len - up)))
+            w[k] + u
         };
-        (w0 + u + extra).round() as i64
+        x.round() as i64
     };
     sorted(events.iter().map(|e| Ev { t: warp(e.t), kind: e.kind }).collect())
 }
@@ -484,21 +572,56 @@ mod tests {
         }
     }
 
-    /// Rubato: the tempo drifts both ways but never more than `rubato`, and it
-    /// comes back to the written tempo between stretches.
+    fn ratios(ev: &[Ev], a: f64) -> Vec<(i64, f64)> {
+        let (x, y) = (ons(ev), ons(&rubato(ev, a)));
+        x.windows(2).zip(y.windows(2)).filter(|(p, _)| p[1].0 > p[0].0 + CHORD_US)
+            .map(|(p, q)| (p[0].0, (q[1].0 - q[0].0) as f64 / (p[1].0 - p[0].0) as f64)).collect()
+    }
+    fn mean_in(r: &[(i64, f64)], from: i64, to: i64) -> f64 {
+        let v: Vec<f64> = r.iter().filter(|x| x.0 >= from && x.0 < to).map(|x| x.1).collect();
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+
+    /// Dense passages are played slower and sparse ones faster, within `amount`.
     #[test]
-    fn rubato_drifts_within_bounds_and_returns() {
-        let ev = sorted((0..1200i64).flat_map(|i| [on(i * 50_000, 60 + (i % 7) as u8), off(i * 50_000 + 40_000, 60 + (i % 7) as u8)]).collect());
+    fn rubato_slows_dense_and_hurries_sparse() {
+        let mut v = vec![];
+        let mut t = 0;
+        while t < 30_000_000 {
+            let dense = (10_000_000..20_000_000).contains(&t);
+            let step = if dense { 80_000 } else { 250_000 };
+            let chord: &[u8] = if dense { &[48, 52, 55, 60, 64, 67] } else { &[72] };
+            for &p in chord { v.push(on(t, p)); v.push(off(t + step - 10_000, p)); }
+            t += step;
+        }
         let a = 0.10;
-        let w = ons(&rubato(&ev, a));
-        let ratio: Vec<f64> = w.windows(2).map(|p| (p[1].0 - p[0].0) as f64 / 50_000.0).collect();
-        assert!(ratio.iter().all(|&r| r > 1.0 - a - 0.001 && r < 1.0 + a + 0.001));
-        assert!(ratio.iter().any(|&r| r > 1.0 + a * 0.4) && ratio.iter().any(|&r| r < 1.0 - a * 0.4), "drifts both ways");
-        let back = ratio.iter().filter(|&&r| (r - 1.0).abs() < 0.005).count();
-        assert!(back >= 5, "returns to the written tempo: {back}");
-        // the length changes by at most half the drift
-        let len = w.last().unwrap().0 as f64 / 59_950_000.0;
-        assert!((len - 1.0).abs() <= a / 2.0, "{len}");
+        let r = ratios(&sorted(v), a);
+        assert!(r.iter().all(|x| x.1 > 1.0 - a - 0.002 && x.1 < 1.0 + a + 0.002));
+        let (sparse, dense) = (mean_in(&r, 2_000_000, 8_000_000), mean_in(&r, 12_000_000, 18_000_000));
+        assert!(dense > 1.0 + a * 0.3, "dense passage slower: {dense}");
+        assert!(sparse < 1.0, "sparse passage faster: {sparse}");
+    }
+
+    /// A phrase pushes on in its middle and slows into its end; after the rest
+    /// the next phrase starts back in tempo.
+    #[test]
+    fn rubato_phrase_arch_and_a_tempo() {
+        let mut v = vec![];
+        for ph in 0..2i64 {
+            for i in 0..30i64 {
+                let t = ph * 7_500_000 + i * 200_000;
+                v.push(on(t, 60 + (i % 5) as u8));
+                v.push(off(t + 190_000, 60 + (i % 5) as u8));
+            }
+        }
+        let a = 0.10;
+        let r = ratios(&sorted(v), a);
+        let mid = mean_in(&r, 2_400_000, 3_600_000);
+        let end = r.iter().filter(|x| x.0 < 6_000_000).last().unwrap().1;
+        assert!(mid < 1.0 - a * 0.2, "middle pushes on: {mid}");
+        assert!(end > 1.0 + a * 0.3, "end slows: {end}");
+        let first = r.iter().find(|x| x.0 >= 7_500_000).unwrap().1;
+        assert!(first < end - a * 0.3, "next phrase back in tempo: {first} vs {end}");
     }
 
     /// Slips land in hard spots only: an easy slow melody never slips; a fast
