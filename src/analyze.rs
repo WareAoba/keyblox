@@ -7,7 +7,6 @@ pub struct Settings {
     pub speed: f64,
     pub transpose: i32,
     pub pedal: bool,
-    pub drums: bool,
     /// optional overrides in ms
     pub dwell: Option<f64>,
     pub hold: Option<f64>,
@@ -23,7 +22,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, rate_count: None, rate_window: None, human: 0 }
+        Settings { speed: 1.0, transpose: 0, pedal: true, dwell: None, hold: None, gap: None, tolerance: None, rate_count: None, rate_window: None, human: 0 }
     }
 }
 
@@ -59,7 +58,7 @@ fn mmss(us: i64) -> String {
 pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     let opt = midi::Options {
         transpose: st.transpose,
-        include_drums: st.drums,
+        include_drums: false, // drums are never played
         pedal: st.pedal,
         pedal_threshold: 64,
         speed: st.speed.clamp(0.1, 10.0),

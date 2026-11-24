@@ -78,8 +78,9 @@ pub enum Wid {
     WinUp,
     HumanDn,
     HumanUp,
+    /// BPM / multiplier switch of the speed row
+    SpeedUnit,
     Pedal,
-    Drums,
     Roblox,
     Vis,
     AddFile,
@@ -102,6 +103,8 @@ pub struct Edit {
 
 pub struct Model {
     pub speed: f64,
+    /// single-tempo songs: set speed as BPM (true) or as a multiplier
+    pub speed_bpm: bool,
     pub transpose: i32,
     /// None = automatic
     pub tol_ms: Option<i32>,
@@ -111,7 +114,6 @@ pub struct Model {
     /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
     pub human: u8,
     pub pedal: bool,
-    pub drums: bool,
     pub roblox_only: bool,
     pub vis_on: bool,
     pub file_name: Option<String>,
@@ -139,13 +141,13 @@ impl Default for Model {
     fn default() -> Self {
         Model {
             speed: 1.0,
+            speed_bpm: true,
             transpose: 0,
             tol_ms: None,
             rate: 20,
             rate_win_ms: 100,
             human: 0,
             pedal: true,
-            drums: false,
             roblox_only: true,
             vis_on: true,
             file_name: None,
@@ -174,7 +176,6 @@ impl Model {
             speed: self.speed,
             transpose: self.transpose,
             pedal: self.pedal,
-            drums: self.drums,
             tolerance: self.tol_ms.map(|t| t as f64),
             rate_count: Some(self.rate as usize),
             rate_window: Some(self.rate_win_ms as f64),
@@ -202,7 +203,7 @@ impl Model {
             // single-tempo songs step by whole BPM, others by 0.05x
             Wid::SpeedDn | Wid::SpeedUp => {
                 let d = if w == Wid::SpeedUp { 1.0 } else { -1.0 };
-                self.speed = match self.base_bpm() {
+                self.speed = match self.bpm_basis() {
                     Some(b) => ((b * self.speed).round() + d) / b,
                     None => ((self.speed + d * 0.05) * 100.0).round() / 100.0,
                 }
@@ -228,8 +229,11 @@ impl Model {
             Wid::WinUp => self.rate_win_ms += 10,
             Wid::HumanDn => self.human = self.human.saturating_sub(1),
             Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
+            Wid::SpeedUnit => {
+                self.speed_bpm = !self.speed_bpm;
+                return false; // same speed, shown another way
+            }
             Wid::Pedal => self.pedal = !self.pedal,
-            Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
                 self.roblox_only = !self.roblox_only;
                 return false;
@@ -256,7 +260,7 @@ impl Model {
             return;
         }
         let text = match row {
-            0 => match self.base_bpm() {
+            0 => match self.bpm_basis() {
                 Some(b) => bpm_text(b * self.speed),
                 None => format!("{:.2}", self.speed),
             },
@@ -313,7 +317,7 @@ impl Model {
             let n = v.round().clamp(-10_000.0, 10_000.0) as i32;
             match e.row {
                 0 => {
-                    self.speed = match self.base_bpm() {
+                    self.speed = match self.bpm_basis() {
                         Some(b) => v / b,
                         None => (v * 100.0).round() / 100.0,
                     }
@@ -339,8 +343,12 @@ impl Model {
     pub fn base_bpm(&self) -> Option<f64> {
         self.summary.as_ref().and_then(|s| s.bpm)
     }
+    /// The BPM that speed is shown and set against, when in BPM mode.
+    fn bpm_basis(&self) -> Option<f64> {
+        self.base_bpm().filter(|_| self.speed_bpm)
+    }
     pub fn speed_text(&self) -> String {
-        match self.base_bpm() {
+        match self.bpm_basis() {
             Some(b) => format!("{} BPM", bpm_text(b * self.speed)),
             None => format!("{:.2}x", self.speed),
         }
@@ -410,7 +418,7 @@ const LIST: R = R::new(SIDE_CARD.x + 8.0, SIDE_CARD.y + 94.0, SIDE_W - 16.0, SID
 const LIST_ROW_H: f32 = 30.0;
 const VIS_CARD: R = R::new(X0, 72.0, W - X0 - M * 2.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(X0, H - M - 84.0, W - X0 - M * 2.0 - RIGHT_W, 84.0);
-const SET_H: f32 = 454.0;
+const SET_H: f32 = 420.0;
 const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
 const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
@@ -432,6 +440,10 @@ fn stepper_rects(row: usize) -> (R, R) {
     let y = ROW0 + row as f32 * ROW_H + 6.0;
     let right = SET_CARD.x + SET_CARD.w - 18.0;
     (R::new(right - 140.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
+}
+/// BPM / 배율 switch next to the "템포" label (single-tempo songs only).
+fn speed_unit_rect() -> R {
+    R::new(SET_CARD.x + 58.0, ROW0 + 6.0, 78.0, 20.0)
 }
 fn field_rect(row: usize) -> R {
     let (a, b) = stepper_rects(row);
@@ -484,7 +496,10 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
         v.push((field_rect(i), Wid::Field(i)));
         v.push((b, *up));
     }
-    for (i, w) in [Wid::Pedal, Wid::Drums, Wid::Roblox, Wid::Vis].iter().enumerate() {
+    if m.base_bpm().is_some() {
+        v.push((speed_unit_rect(), Wid::SpeedUnit));
+    }
+    for (i, w) in [Wid::Pedal, Wid::Roblox, Wid::Vis].iter().enumerate() {
         v.push((toggle_row(i), *w));
     }
     v
@@ -798,12 +813,13 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 
 // ---------------------------------------------------------------- render
 /// Everything that changes the static layer.
-fn static_sig(cv: &Canvas, m: &Model) -> u64 {
+fn static_sig(scale: f32, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
-    (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
-    (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
+    (m.pedal, m.speed_bpm, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
+    (m.state, m.hover, m.pressed, scale.to_bits()).hash(&mut h);
+    m.edit.as_ref().map(|e| (e.row, &e.text, e.fresh)).hash(&mut h);
     (m.songs_ver, m.song_sel, m.song_scroll).hash(&mut h);
     if let Some(su) = &m.summary {
         (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok, su.bpm.map(f64::to_bits)).hash(&mut h);
@@ -812,7 +828,7 @@ fn static_sig(cv: &Canvas, m: &Model) -> u64 {
 }
 
 pub fn render(cv: &mut Canvas, m: &Model) {
-    let sig = static_sig(cv, m);
+    let sig = static_sig(cv.s, m);
     if cv.bg.is_none() || cv.bg_sig != sig {
         render_static(cv, m);
         cv.bg = Some(cv.pm.clone());
@@ -1225,6 +1241,19 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             Wid::HumanUp,
         ),
     ];
+    if m.base_bpm().is_some() {
+        let r = speed_unit_rect();
+        let hov = m.hover == Some(Wid::SpeedUnit) && ed;
+        cv.rr(r.x, r.y, r.w, r.h, 10.0, col(if hov { 0x283044 } else { CARD2 }, 1.0));
+        let half = r.w / 2.0;
+        let on_x = if m.speed_bpm { r.x } else { r.x + half };
+        cv.rr(on_x + 2.0, r.y + 2.0, half - 4.0, r.h - 4.0, 8.0, col(ACCENT, la));
+        for (k, t) in ["BPM", "배율"].iter().enumerate() {
+            let sel = (k == 0) == m.speed_bpm;
+            let a = if sel { la } else { 0.55 * la };
+            cv.text_c(r.x + half * (k as f32 + 0.5), r.cy() + 1.0, 11.0, sel, col(TEXT, a), t);
+        }
+    }
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {
         label(cv, i, t, sub);
         let (a, b) = stepper_rects(i);
@@ -1266,7 +1295,6 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
     cv.rect(c.x + 20.0, TOG0 - 6.0, c.w - 40.0, 1.0, col(BORDER, 1.0));
     let toggles = [
         ("서스테인 페달 → Space", m.pedal, Wid::Pedal, ed),
-        ("드럼 채널 포함", m.drums, Wid::Drums, ed),
         ("Roblox 창에만 입력", m.roblox_only, Wid::Roblox, true),
         ("비주얼라이저", m.vis_on, Wid::Vis, true),
     ];
@@ -1521,5 +1549,42 @@ mod tests {
         let mut m = playing(false);
         m.begin_edit(3);
         assert!(m.edit.is_none());
+    }
+
+    #[test]
+    fn single_tempo_song_can_step_speed_as_multiplier() {
+        let mut m = Model::default();
+        m.summary = Some(Summary { bpm: Some(120.0), ..Summary::default() });
+        assert!(!m.click_setting(Wid::SpeedUnit));
+        assert_eq!(m.speed_text(), "1.00x");
+        m.click_setting(Wid::SpeedUp);
+        assert_eq!(m.speed_text(), "1.05x");
+        assert!(typed(&mut m, 0, "1.5"));
+        assert_eq!(m.speed, 1.5);
+        m.click_setting(Wid::SpeedUnit);
+        assert_eq!(m.speed_text(), "180 BPM");
+    }
+
+    #[test]
+    fn unit_switch_only_for_single_tempo_songs() {
+        let mut m = Model::default();
+        assert!(!widgets(&m).iter().any(|(_, w)| *w == Wid::SpeedUnit));
+        m.summary = Some(Summary { bpm: Some(120.0), ..Summary::default() });
+        assert!(widgets(&m).iter().any(|(_, w)| *w == Wid::SpeedUnit));
+    }
+
+    #[test]
+    fn typing_and_holding_repaint_the_settings_card() {
+        let mut m = Model::default();
+        let sig = |m: &Model| static_sig(1.0, m);
+        let s0 = sig(&m);
+        m.pressed = Some(Wid::RateUp);
+        assert_ne!(sig(&m), s0);
+        m.pressed = None;
+        m.begin_edit(3);
+        let s1 = sig(&m);
+        assert_ne!(s1, s0);
+        m.edit_char('5');
+        assert_ne!(sig(&m), s1);
     }
 }
