@@ -70,6 +70,11 @@ fn main() {
             if let Some(h) = val("--hover-song") { m.hover = Some(ui::Wid::SongDel(h as usize)); }
         }
         if args.iter().any(|a| a == "--novis") { m.vis_on = false; }
+        if args.iter().any(|a| a == "--speed-x") { m.speed_bpm = false; }
+        if let Some(i) = args.iter().position(|a| a == "--edit") {
+            let (r, t) = args[i + 1].split_once(':').unwrap();
+            m.edit = Some(ui::Edit { row: r.parse().unwrap(), text: t.trim_start_matches('*').into(), fresh: t.starts_with('*') });
+        }
         let t0 = std::time::Instant::now();
         let n = 30;
         for k in 0..n { m.pos_us = (at * 1e6) as i64 + k * 16_666; ui::render(&mut cv, &m); }

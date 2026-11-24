@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
@@ -50,6 +51,17 @@ struct App {
     /// what the last painted frame showed: (state, ui::frame_key, analyzing, hover)
     last_frame: (u8, i64, bool, Option<Wid>),
     dirty: bool,
+    hold: Option<Hold>,
+}
+
+/// A -/+ button being held down: repeats until released.
+struct Hold {
+    wid: Wid,
+    t0: Instant,
+    /// ms after `t0` when the next step fires
+    next: u64,
+    /// a step changed the settings: analyze on release
+    changed: bool,
 }
 
 struct Done {
@@ -247,6 +259,23 @@ fn seek_to(app: &mut App, x: f32) {
     }
 }
 
+/// Apply the value being typed, if any.
+fn commit_edit(a: &mut App) {
+    if a.model.commit_edit() {
+        analyze_async(a);
+    }
+    a.dirty = true;
+}
+
+/// The held -/+ button was let go (or the mouse capture was lost).
+fn end_hold(a: &mut App) {
+    if let Some(h) = a.hold.take() {
+        if h.changed {
+            analyze_async(a);
+        }
+    }
+}
+
 fn click(hwnd: HWND, wid: Wid) {
     match wid {
         Wid::Open => {
@@ -345,6 +374,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 m.state = player::state();
                 m.pos_us = player::position_us().min(m.length_us().max(0));
                 m.blocked = player::input_blocked();
+                if m.edit.is_some() && !m.editable() {
+                    m.cancel_edit(); // playback started (F6) while typing
+                    a.dirty = true;
+                }
+                if let Some(h) = &mut a.hold {
+                    let ms = h.t0.elapsed().as_millis() as u64;
+                    if m.hover != Some(h.wid) {
+                        h.next = h.next.max(ms); // paused while the pointer is off the button
+                    }
+                    let mut n = 0;
+                    while h.next <= ms && n < 4 {
+                        h.changed |= m.click_setting(h.wid);
+                        h.next = ui::next_repeat(h.next);
+                        n += 1;
+                        a.dirty = true;
+                    }
+                }
                 if IsIconic(hwnd) != 0 {
                     return; // nothing to show; restoring repaints the whole window
                 }
@@ -402,10 +448,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             with_app(|a| {
                 let (x, y) = mouse_xy(a, lp);
-                a.model.pressed = ui::hit(&a.model, x, y);
-                if a.model.pressed == Some(Wid::Seek) {
-                    SetCapture(hwnd);
-                    seek_to(a, x);
+                let h = ui::hit(&a.model, x, y);
+                if let Some(e) = &a.model.edit {
+                    if h != Some(Wid::Field(e.row)) {
+                        commit_edit(a);
+                    }
+                }
+                a.model.pressed = h;
+                match h {
+                    Some(Wid::Seek) => {
+                        SetCapture(hwnd);
+                        seek_to(a, x);
+                    }
+                    Some(Wid::Field(i)) if a.model.edit.is_none() => a.model.begin_edit(i),
+                    // -/+ step on press and keep stepping while held
+                    Some(w) if ui::is_stepper(w) && a.model.editable() => {
+                        let changed = a.model.click_setting(w);
+                        a.hold = Some(Hold { wid: w, t0: Instant::now(), next: ui::next_repeat(0), changed });
+                        SetCapture(hwnd);
+                    }
+                    _ => {}
                 }
                 a.dirty = true;
             });
@@ -419,7 +481,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if p == Some(Wid::Seek) {
                     ReleaseCapture();
                     None
-                } else if p.is_some() && p == ui::hit(&a.model, x, y) {
+                } else if a.hold.is_some() {
+                    end_hold(a);
+                    ReleaseCapture();
+                    None
+                } else if p.is_some_and(|w| !ui::is_stepper(w) && !matches!(w, Wid::Field(_)))
+                    && p == ui::hit(&a.model, x, y)
+                {
                     p
                 } else {
                     None
@@ -430,6 +498,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 click(hwnd, wid);
             }
             0
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|a| {
+                if a.hold.is_some() {
+                    end_hold(a);
+                    a.model.pressed = None;
+                    a.dirty = true;
+                }
+            });
+            0
+        }
+        WM_CHAR => {
+            let typing = with_app(|a| {
+                a.model.edit.as_ref()?;
+                match wp as u32 {
+                    0x0D => commit_edit(a),
+                    0x1B => a.model.cancel_edit(),
+                    0x08 => a.model.edit_backspace(),
+                    c => a.model.edit_char(char::from_u32(c).unwrap_or('\0')),
+                }
+                a.dirty = true;
+                Some(())
+            })
+            .flatten();
+            if typing.is_some() { 0 } else { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_SETCURSOR => {
             let over = with_app(|a| a.model.hover.is_some()).unwrap_or(false);
@@ -477,6 +570,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // coming back to the app: pick up files added to linked folders
             if (wp & 0xFFFF) as u32 != WA_INACTIVE {
                 with_app(refresh_songs);
+            } else {
+                with_app(commit_edit);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -602,6 +697,7 @@ pub fn run(initial: Option<String>) {
                 tracking: false,
                 last_frame: (255, -1, false, None),
                 dirty: true,
+                hold: None,
             })
         });
         with_app(refresh_songs);
