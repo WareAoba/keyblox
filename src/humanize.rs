@@ -13,6 +13,15 @@
 //! - Note lengths are kept, except that a note which ended by the next moment
 //!   still ends by that moment's new start (released before its Shift/Ctrl
 //!   switch); pedal events are not moved.
+//! - Rubato: the song is cut into 3-8 s stretches; in each the tempo drifts
+//!   gradually up or down to `rubato` (fraction) and then snaps back over the
+//!   last fifth. Expressive piano timing varies by about 10% (eighth-note IOI
+//!   sd 9.5% in Timmers et al. 2003); "strong" uses that, lower levels less.
+//! - Slips: notes in hard spots (fast notes in one hand, big leaps, inner chord
+//!   voices) sometimes go wrong: left out, a neighbouring key grazed as well, or
+//!   the neighbouring key instead (split about 43/39/18%, as in Flossmann &
+//!   Widmer 2011). The melody (top note) slips least (Palmer & van de Sande 1993).
+//!   How often is our choice; no study gives a per-note rate for this.
 //! - The random sequence is fixed, so the same file and settings always give the
 //!   same performance (and the visualizer shows exactly what is played).
 
@@ -30,14 +39,26 @@ pub struct Human {
     pub jitter: i64,
     /// how far behind the melody note the rest of a chord may come (us)
     pub lead: i64,
+    /// largest tempo drift of a rubato stretch (0.06 = 6%)
+    pub rubato: f64,
+    /// slip probability per point of difficulty (a note scores 0-3)
+    pub slip: f64,
+}
+
+/// What the slips pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Slips {
+    pub missed: usize,
+    pub grazed: usize,
+    pub wrong: usize,
 }
 
 /// 0 = off, 1..=3 = light / medium / strong
 pub fn level(n: u8) -> Option<Human> {
     match n {
-        1 => Some(Human { jitter: 3_000, lead: 10_000 }),
-        2 => Some(Human { jitter: 6_000, lead: 20_000 }),
-        3 => Some(Human { jitter: 10_000, lead: 30_000 }),
+        1 => Some(Human { jitter: 3_000, lead: 10_000, rubato: 0.03, slip: 0.002 }),
+        2 => Some(Human { jitter: 6_000, lead: 20_000, rubato: 0.06, slip: 0.006 }),
+        3 => Some(Human { jitter: 10_000, lead: 30_000, rubato: 0.10, slip: 0.015 }),
         _ => None,
     }
 }
@@ -63,7 +84,170 @@ impl Rng {
 
 const SEED: u64 = 0x6B65_7962_6C6F_7821;
 
-pub fn apply(events: &[Ev], h: Human) -> Vec<Ev> {
+/// Rubato, then slips, then per-moment timing (see the module comment).
+pub fn apply(events: &[Ev], h: Human) -> (Vec<Ev>, Slips) {
+    let ev = rubato(events, h.rubato);
+    let (ev, slips) = slip(&ev, h.slip);
+    (timing(&ev, h), slips)
+}
+
+fn sorted(mut v: Vec<Ev>) -> Vec<Ev> {
+    // same order as midi::parse: time, then offs before pedal before ons (stable)
+    v.sort_by_key(|e| (e.t, class(e.kind)));
+    v
+}
+
+/// Time warp: in each stretch the rate of time drifts linearly from 1 to 1+e
+/// (e = ±amount) over the first 4/5, then back to 1 over the last 1/5.
+/// Always increasing, so event order is kept.
+fn rubato(events: &[Ev], amount: f64) -> Vec<Ev> {
+    let end = events.last().map(|e| e.t).unwrap_or(0);
+    if amount <= 0.0 || end <= 0 {
+        return events.to_vec();
+    }
+    let mut rng = Rng(SEED ^ 0x7275_6261_746F);
+    // (start, length, e) per stretch, and the warped time at each start
+    let mut segs: Vec<(f64, f64, f64, f64)> = vec![];
+    let (mut t, mut w) = (0.0f64, 0.0f64);
+    while t <= end as f64 {
+        let len = 3e6 + 5e6 * rng.unit();
+        let e = amount * (0.5 + 0.5 * rng.unit()) * if rng.next() & 1 == 0 { 1.0 } else { -1.0 };
+        segs.push((t, len, e, w));
+        w += len + e * len / 2.0; // area of the triangle-shaped drift
+        t += len;
+    }
+    const RISE: f64 = 0.8;
+    let warp = |x: i64| -> i64 {
+        let x = x as f64;
+        let k = segs.partition_point(|s| s.0 <= x).saturating_sub(1);
+        let (s0, len, e, w0) = segs[k];
+        let u = x - s0;
+        let up = RISE * len;
+        let extra = if u <= up {
+            e * u * u / (2.0 * up)
+        } else {
+            let v = u - up;
+            e * up / 2.0 + e * (v - v * v / (2.0 * (len - up)))
+        };
+        (w0 + u + extra).round() as i64
+    };
+    sorted(events.iter().map(|e| Ev { t: warp(e.t), kind: e.kind }).collect())
+}
+
+/// One note: start, end, pitch.
+#[derive(Clone, Copy)]
+struct Note {
+    on: i64,
+    off: i64,
+    pitch: u8,
+}
+
+fn pair(events: &[Ev]) -> (Vec<Note>, Vec<Ev>) {
+    let mut notes: Vec<Note> = vec![];
+    let mut open: Vec<std::collections::VecDeque<usize>> = vec![Default::default(); 128];
+    let mut pedal = vec![];
+    let end = events.last().map(|e| e.t).unwrap_or(0);
+    for e in events {
+        match e.kind {
+            Kind::NoteOn(p) => {
+                notes.push(Note { on: e.t, off: end, pitch: p });
+                open[p as usize].push_back(notes.len() - 1);
+            }
+            Kind::NoteOff(p) => {
+                if let Some(i) = open[p as usize].pop_front() {
+                    notes[i].off = e.t;
+                }
+            }
+            Kind::Pedal(_) => pedal.push(*e),
+        }
+    }
+    (notes, pedal)
+}
+
+fn unpair(notes: &[Note], pedal: Vec<Ev>) -> Vec<Ev> {
+    let mut v = pedal;
+    for n in notes {
+        v.push(Ev { t: n.on, kind: Kind::NoteOn(n.pitch) });
+        v.push(Ev { t: n.off, kind: Kind::NoteOff(n.pitch) });
+    }
+    sorted(v)
+}
+
+/// Notes starting within CHORD_US of `t` (notes are sorted by start).
+fn same_moment(notes: &[Note], t: i64) -> &[Note] {
+    let a = notes.partition_point(|m| m.on < t - CHORD_US);
+    let b = notes.partition_point(|m| m.on <= t + CHORD_US);
+    &notes[a..b]
+}
+
+/// How hard a note is to hit cleanly, 0-3, and whether it is the melody (top
+/// note of its moment). Hands are approximated as below / from middle C.
+fn difficulty(notes: &[Note], i: usize) -> (u32, bool) {
+    let n = notes[i];
+    let right = n.pitch >= 60;
+    let moment = same_moment(notes, n.on);
+    let hi = moment.iter().map(|m| m.pitch).max().unwrap();
+    let lo = moment.iter().map(|m| m.pitch).min().unwrap();
+    let mut d = 0;
+    if moment.len() >= 3 && n.pitch != hi && n.pitch != lo {
+        d += 1; // inner voice
+    }
+    // the previous note in the same hand, from an earlier moment
+    let prev = notes[..i].iter().rev().take(64).find(|m| (m.pitch >= 60) == right && n.on - m.on > CHORD_US);
+    if let Some(m) = prev {
+        let gap = n.on - m.on;
+        if gap < 90_000 {
+            d += 1; // fast notes
+        }
+        if gap < 200_000 && (n.pitch as i32 - m.pitch as i32).abs() > 12 {
+            d += 1; // leap
+        }
+    }
+    (d, n.pitch == hi && moment.len() >= 2 || moment.len() == 1 && right)
+}
+
+fn slip(events: &[Ev], rate: f64) -> (Vec<Ev>, Slips) {
+    let mut st = Slips::default();
+    if rate <= 0.0 {
+        return (events.to_vec(), st);
+    }
+    let (notes, pedal) = pair(events);
+    let mut rng = Rng(SEED ^ 0x736C_6970);
+    let mut out: Vec<Note> = Vec::with_capacity(notes.len());
+    for i in 0..notes.len() {
+        let n = notes[i];
+        let (d, melody) = difficulty(&notes, i);
+        let p = rate * d as f64 * if melody { 0.3 } else { 1.0 };
+        if d == 0 || rng.unit() >= p {
+            out.push(n);
+            continue;
+        }
+        // a neighbouring key (a semitone off) that is not already in this moment
+        let up = rng.next() & 1 == 0;
+        let near = [if up { 1 } else { -1 }, if up { -1 } else { 1 }]
+            .into_iter()
+            .map(|s| n.pitch as i32 + s)
+            .find(|&q| (21..=108).contains(&q) && !same_moment(&notes, n.on).iter().any(|m| m.pitch as i32 == q))
+            .map(|q| q as u8);
+        let r = rng.unit();
+        match near {
+            _ if r < 0.43 => st.missed += 1, // left out
+            Some(q) if r < 0.82 => {
+                out.push(n);
+                out.push(Note { on: n.on, off: n.on + (n.off - n.on).min(60_000), pitch: q });
+                st.grazed += 1;
+            }
+            Some(q) => {
+                out.push(Note { pitch: q, ..n });
+                st.wrong += 1;
+            }
+            None => out.push(n),
+        }
+    }
+    (unpair(&out, pedal), st)
+}
+
+fn timing(events: &[Ev], h: Human) -> Vec<Ev> {
     let mut rng = Rng(SEED);
     // note-on indices in time order, and each one's shift
     let ons: Vec<usize> = (0..events.len()).filter(|&i| matches!(events[i].kind, Kind::NoteOn(_))).collect();
@@ -154,9 +338,7 @@ pub fn apply(events: &[Ev], h: Human) -> Vec<Ev> {
             Kind::Pedal(_) => out.push(*e),
         }
     }
-    // same order as midi::parse: time, then offs before pedal before ons (stable)
-    out.sort_by_key(|e| (e.t, class(e.kind)));
-    out
+    sorted(out)
 }
 
 #[cfg(test)]
@@ -165,7 +347,8 @@ mod tests {
     use crate::layout::Mod;
     use crate::schedule;
 
-    const H: Human = Human { jitter: 6_000, lead: 20_000 };
+    /// timing only, so the timing tests see exact positions
+    const H: Human = Human { jitter: 6_000, lead: 20_000, rubato: 0.0, slip: 0.0 };
 
     /// largest shift `apply` can give any note
     fn max_shift(h: Human) -> i64 { h.jitter * 5 / 2 + h.lead }
@@ -211,7 +394,7 @@ mod tests {
             v.push(off(t + 15_000, p));
         }
         let ev = sorted(v);
-        let hv = apply(&ev, H);
+        let hv = apply(&ev, H).0;
         assert_eq!(hv.len(), ev.len());
         let (a, b) = (notes(&ev), notes(&hv));
         let mut moved = 0;
@@ -239,7 +422,7 @@ mod tests {
             on(2_000_000, 60), on(2_000_000, 61), on(2_000_000, 64), on(2_000_000, 67),
             off(2_500_000, 60), off(2_500_000, 61), off(2_500_000, 64), off(2_500_000, 67),
         ]);
-        let hv = apply(&ev, H);
+        let hv = apply(&ev, H).0;
         let o = ons(&hv);
         let first = &o[..4];
         assert_eq!(first[0].1, 76, "melody first");
@@ -255,7 +438,7 @@ mod tests {
         // the same pitch from two tracks at one instant is struck once, as without humanize
         let ev = sorted(vec![on(0, 60), on(0, 64), on(0, 67), on(0, 67), off(400_000, 60), off(400_000, 64), off(400_000, 67), off(400_000, 67)]);
         let p = schedule::Params::default();
-        let s = schedule::build(&apply(&ev, H), p);
+        let s = schedule::build(&apply(&ev, H).0, p);
         assert_eq!((s.strikes, s.merged), (3, 1));
     }
 
@@ -296,15 +479,56 @@ mod tests {
         let ev = sorted(v);
         let base = release_mismatch(&ev);
         for lv in 1..=3 {
-            let hv = release_mismatch(&apply(&ev, level(lv).unwrap()));
+            let hv = release_mismatch(&apply(&ev, level(lv).unwrap()).0);
             assert!(hv <= base, "level {lv}: {hv} releases under another modifier (unhumanized {base})");
         }
+    }
+
+    /// Rubato: the tempo drifts both ways but never more than `rubato`, and it
+    /// comes back to the written tempo between stretches.
+    #[test]
+    fn rubato_drifts_within_bounds_and_returns() {
+        let ev = sorted((0..1200i64).flat_map(|i| [on(i * 50_000, 60 + (i % 7) as u8), off(i * 50_000 + 40_000, 60 + (i % 7) as u8)]).collect());
+        let a = 0.10;
+        let w = ons(&rubato(&ev, a));
+        let ratio: Vec<f64> = w.windows(2).map(|p| (p[1].0 - p[0].0) as f64 / 50_000.0).collect();
+        assert!(ratio.iter().all(|&r| r > 1.0 - a - 0.001 && r < 1.0 + a + 0.001));
+        assert!(ratio.iter().any(|&r| r > 1.0 + a * 0.4) && ratio.iter().any(|&r| r < 1.0 - a * 0.4), "drifts both ways");
+        let back = ratio.iter().filter(|&&r| (r - 1.0).abs() < 0.005).count();
+        assert!(back >= 5, "returns to the written tempo: {back}");
+        // the length changes by at most half the drift
+        let len = w.last().unwrap().0 as f64 / 59_950_000.0;
+        assert!((len - 1.0).abs() <= a / 2.0, "{len}");
+    }
+
+    /// Slips land in hard spots only: an easy slow melody never slips; a fast
+    /// leaping passage with inner voices does, and inner voices more than the top.
+    #[test]
+    fn slips_only_where_it_is_hard() {
+        let easy = sorted((0..400i64).flat_map(|i| [on(i * 400_000, 60 + (i % 5) as u8), off(i * 400_000 + 380_000, 60 + (i % 5) as u8)]).collect());
+        let (_, s) = slip(&easy, 0.05);
+        assert_eq!(s, Slips::default());
+
+        // 3-note chords every 70 ms, jumping 2 octaves back and forth
+        let mut v = vec![];
+        for i in 0..3000i64 {
+            let b = if i % 2 == 0 { 48u8 } else { 74 };
+            for p in [b, b + 4, b + 7] { v.push(on(i * 70_000, p)); v.push(off(i * 70_000 + 60_000, p)); }
+        }
+        let hard = sorted(v);
+        let (out, s) = slip(&hard, 0.02);
+        assert!(s.missed > 0 && s.grazed > 0 && s.wrong > 0, "{s:?}");
+        assert_eq!(ons(&out).len(), ons(&hard).len() - s.missed + s.grazed);
+        // inner voice (b+4) slips more than the top (b+7)
+        let kept = |q: u8| ons(&out).iter().filter(|x| x.1 == q || x.1 == q + 26).count();
+        assert!(kept(52) < kept(55), "inner {} top {}", kept(52), kept(55));
     }
 
     #[test]
     fn same_result_every_time() {
         let ev = sorted((0..50).flat_map(|i| [on(i * 100_000, 60 + (i % 5) as u8), off(i * 100_000 + 90_000, 60 + (i % 5) as u8)]).collect());
-        assert_eq!(apply(&ev, H), apply(&ev, H));
+        let h = level(3).unwrap();
+        assert_eq!(apply(&ev, h), apply(&ev, h));
     }
 
     #[test]
@@ -322,7 +546,7 @@ mod tests {
                 if rnd(10) == 0 { v.push(Ev { t, kind: Kind::Pedal(rnd(2) == 0) }); }
             }
             let h = level(1 + (round % 3) as u8).unwrap();
-            let hv = apply(&sorted(v), h);
+            let hv = apply(&sorted(v), h).0;
             let p = schedule::Params::default();
             let s = schedule::build(&hv, p);
             schedule::verify(&s.actions, p).unwrap();
