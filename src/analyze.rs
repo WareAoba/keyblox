@@ -38,6 +38,8 @@ pub struct Summary {
     pub length_us: i64,
     pub max_late_us: i64,
     pub ok: bool,
+    /// original BPM of a single-tempo song
+    pub bpm: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -90,7 +92,10 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     let mut r = vec![];
     r.push(format!("길이: {}   (속도 x{})", mmss(parsed.length_us), opt.speed));
     r.push(format!("음표: {}개   (88키 밖이라 옥타브 이동 {}개)", parsed.notes, parsed.folded));
-    r.push(format!("템포 메타 이벤트: {}개 (모두 반영)", parsed.tempo_changes));
+    r.push(match parsed.bpm {
+        Some(b) => format!("템포 메타 이벤트: {}개 (단일 템포 {:.1} BPM)", parsed.tempo_changes, b),
+        None => format!("템포 메타 이벤트: {}개 (모두 반영)", parsed.tempo_changes),
+    });
     r.push(if st.pedal { format!("페달: {}회 변화 -> 스페이스", parsed.pedal_changes) } else { "페달: 끔".into() });
     r.push(format!(
         "규칙: Shift/Ctrl 전환 간격 {:.1}ms, 허용 지연 {:.1}ms, 최대 타건 {}",
@@ -128,6 +133,7 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         length_us: parsed.length_us,
         max_late_us: s.max_late,
         ok,
+        bpm: parsed.bpm,
     };
     Ok(Analysis { schedule: s, report: r, length_us: parsed.length_us, ok, summary })
 }
