@@ -18,7 +18,6 @@ use tiny_skia::{
 
 pub const W: f32 = 1120.0 + SIDE_W + M;
 pub const H: f32 = 700.0;
-pub const FPS_CHOICES: [f64; 5] = [60.0, 120.0, 144.0, 165.0, 240.0];
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
 // player states (same numbers as player.rs)
@@ -67,7 +66,6 @@ pub enum Wid {
     Play,
     Stop,
     Seek,
-    Fps(u8),
     SpeedDn,
     SpeedUp,
     TransDn,
@@ -76,6 +74,10 @@ pub enum Wid {
     TolUp,
     RateDn,
     RateUp,
+    WinDn,
+    WinUp,
+    HumanDn,
+    HumanUp,
     Pedal,
     Drums,
     Roblox,
@@ -89,12 +91,15 @@ pub enum Wid {
 }
 
 pub struct Model {
-    pub fps_idx: usize,
     pub speed: f64,
     pub transpose: i32,
-    /// None = automatic (follows FPS)
+    /// None = automatic
     pub tol_ms: Option<i32>,
+    /// strikes allowed per `rate_win_ms` (0 = unlimited)
     pub rate: i32,
+    pub rate_win_ms: i32,
+    /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
+    pub human: u8,
     pub pedal: bool,
     pub drums: bool,
     pub roblox_only: bool,
@@ -122,11 +127,12 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Model {
-            fps_idx: 0,
             speed: 1.0,
             transpose: 0,
             tol_ms: None,
-            rate: 200,
+            rate: 20,
+            rate_win_ms: 100,
+            human: 0,
             pedal: true,
             drums: false,
             roblox_only: true,
@@ -153,18 +159,19 @@ impl Default for Model {
 impl Model {
     pub fn settings(&self) -> Settings {
         Settings {
-            fps: FPS_CHOICES[self.fps_idx],
             speed: self.speed,
             transpose: self.transpose,
             pedal: self.pedal,
             drums: self.drums,
             tolerance: self.tol_ms.map(|t| t as f64),
-            max_rate: Some(self.rate as f64),
+            rate_count: Some(self.rate as usize),
+            rate_window: Some(self.rate_win_ms as f64),
+            human: self.human,
             ..Settings::default()
         }
     }
     pub fn auto_tol_ms(&self) -> i32 {
-        let p = crate::schedule::Params::from_fps(FPS_CHOICES[self.fps_idx]);
+        let p = crate::schedule::Params::default();
         (p.tolerance as f64 / 1000.0).round() as i32
     }
     pub fn editable(&self) -> bool {
@@ -180,9 +187,14 @@ impl Model {
             return false;
         }
         match w {
-            Wid::Fps(i) => self.fps_idx = i as usize,
-            Wid::SpeedDn => self.speed = ((self.speed - 0.05) * 100.0).round() / 100.0,
-            Wid::SpeedUp => self.speed = ((self.speed + 0.05) * 100.0).round() / 100.0,
+            // single-tempo songs step by whole BPM, others by 0.05x
+            Wid::SpeedDn | Wid::SpeedUp => {
+                let d = if w == Wid::SpeedUp { 1.0 } else { -1.0 };
+                self.speed = match self.base_bpm() {
+                    Some(b) => ((b * self.speed).round() + d) / b,
+                    None => ((self.speed + d * 0.05) * 100.0).round() / 100.0,
+                }
+            }
             Wid::TransDn => self.transpose -= 1,
             Wid::TransUp => self.transpose += 1,
             Wid::TolDn => {
@@ -198,8 +210,12 @@ impl Model {
                     Some(t) => Some(t + 5),
                 }
             }
-            Wid::RateDn => self.rate -= 25,
-            Wid::RateUp => self.rate += 25,
+            Wid::RateDn => self.rate -= 1,
+            Wid::RateUp => self.rate += 1,
+            Wid::WinDn => self.rate_win_ms -= 10,
+            Wid::WinUp => self.rate_win_ms += 10,
+            Wid::HumanDn => self.human = self.human.saturating_sub(1),
+            Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
@@ -215,8 +231,26 @@ impl Model {
         self.speed = self.speed.clamp(0.25, 3.0);
         self.transpose = self.transpose.clamp(-24, 24);
         self.tol_ms = self.tol_ms.map(|t| t.clamp(0, 150));
-        self.rate = self.rate.clamp(0, 1000);
+        self.rate = self.rate.clamp(0, 200);
+        self.rate_win_ms = self.rate_win_ms.clamp(10, 1000);
         true
+    }
+    /// A different song was opened: speed/tempo is kept per song only.
+    pub fn open_song(&mut self, name: String) {
+        self.file_name = Some(name);
+        self.summary = None;
+        self.speed = 1.0;
+        self.set_vis(vec![]);
+    }
+    /// Original BPM of the loaded song, when it uses a single tempo.
+    pub fn base_bpm(&self) -> Option<f64> {
+        self.summary.as_ref().and_then(|s| s.bpm)
+    }
+    pub fn speed_text(&self) -> String {
+        match self.base_bpm() {
+            Some(b) => format!("{} BPM", bpm_text(b * self.speed)),
+            None => format!("{:.2}x", self.speed),
+        }
     }
     pub fn set_songs(&mut self, rows: Vec<Row>) {
         self.songs = rows;
@@ -231,6 +265,10 @@ impl Model {
     pub fn length_us(&self) -> i64 {
         self.summary.as_ref().map(|s| s.length_us).unwrap_or(0)
     }
+}
+
+fn bpm_text(b: f64) -> String {
+    if (b - b.round()).abs() < 0.05 { format!("{:.0}", b) } else { format!("{:.1}", b) }
 }
 
 // ---------------------------------------------------------------- layout
@@ -268,12 +306,13 @@ const LIST: R = R::new(SIDE_CARD.x + 8.0, SIDE_CARD.y + 94.0, SIDE_W - 16.0, SID
 const LIST_ROW_H: f32 = 30.0;
 const VIS_CARD: R = R::new(X0, 72.0, W - X0 - M * 2.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(X0, H - M - 84.0, W - X0 - M * 2.0 - RIGHT_W, 84.0);
-const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 412.0);
-const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 412.0 + 12.0, RIGHT_W, H - M - (72.0 + 412.0 + 12.0));
+const SET_H: f32 = 454.0;
+const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
+const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const ROW0: f32 = SET_CARD.y + 56.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 5.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -289,11 +328,6 @@ fn stepper_rects(row: usize) -> (R, R) {
     let y = ROW0 + row as f32 * ROW_H + 6.0;
     let right = SET_CARD.x + SET_CARD.w - 18.0;
     (R::new(right - 124.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
-}
-fn seg_rect(i: usize) -> R {
-    let right = SET_CARD.x + SET_CARD.w - 18.0;
-    let w = 40.0;
-    R::new(right - w * FPS_CHOICES.len() as f32 + w * i as f32, ROW0 + 7.0, w, 28.0)
 }
 fn list_rows() -> usize {
     (LIST.h / LIST_ROW_H) as usize
@@ -328,12 +362,16 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
     v.push((R::new(sx - sr, sy - sr, sr * 2.0, sr * 2.0), Wid::Stop));
     let sb = seek_bar();
     v.push((R::new(sb.x - 6.0, sb.y - 10.0, sb.w + 12.0, sb.h + 20.0), Wid::Seek));
-    for i in 0..FPS_CHOICES.len() {
-        v.push((seg_rect(i), Wid::Fps(i as u8)));
-    }
-    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp)];
+    let pairs = [
+        (Wid::SpeedDn, Wid::SpeedUp),
+        (Wid::TransDn, Wid::TransUp),
+        (Wid::TolDn, Wid::TolUp),
+        (Wid::RateDn, Wid::RateUp),
+        (Wid::WinDn, Wid::WinUp),
+        (Wid::HumanDn, Wid::HumanUp),
+    ];
     for (i, (dn, up)) in pairs.iter().enumerate() {
-        let (a, b) = stepper_rects(i + 1);
+        let (a, b) = stepper_rects(i);
         v.push((a, *dn));
         v.push((b, *up));
     }
@@ -355,6 +393,32 @@ pub fn hit(m: &Model, x: f32, y: f32) -> Option<Wid> {
 pub fn seek_fraction(x: f32) -> f64 {
     let sb = seek_bar();
     (((x - sb.x) / sb.w) as f64).clamp(0.0, 1.0)
+}
+
+/// The part of the window that changes while a song plays (visualizer and
+/// transport). Everything else comes from the static layer.
+pub fn dynamic_rect() -> R {
+    R::new(VIS_CARD.x, VIS_CARD.y, VIS_CARD.w.max(TRANSPORT.w), TRANSPORT.y + TRANSPORT.h - VIS_CARD.y)
+}
+
+/// Seek bar fill as a fraction of the song.
+fn progress(m: &Model) -> f32 {
+    let len = m.length_us();
+    (if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 }) as f32
+}
+
+/// Changes exactly when the moving part of the frame would look different:
+/// every position while falling notes are shown, otherwise only when the
+/// clock or the seek bar (in quarter device pixels) moves, or the input-blocked
+/// warning appears.
+pub fn frame_key(m: &Model, scale: f32) -> i64 {
+    let shown = if m.vis_on && !m.vis.is_empty() {
+        m.pos_us
+    } else {
+        let bar = (seek_bar().w * progress(m) * scale * 4.0).round() as i64;
+        (m.pos_us.max(0) / 1_000_000) << 24 | bar
+    };
+    shown << 1 | m.blocked as i64
 }
 
 // ---------------------------------------------------------------- canvas
@@ -408,18 +472,6 @@ fn rrect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
 
 fn solid(c: Color) -> Paint<'static> {
     Paint { shader: Shader::SolidColor(c), anti_alias: true, ..Paint::default() }
-}
-
-fn vgrad(y0: f32, y1: f32, c0: Color, c1: Color) -> Paint<'static> {
-    let sh = LinearGradient::new(
-        Point::from_xy(0.0, y0),
-        Point::from_xy(0.0, y1),
-        vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or(Shader::SolidColor(c0));
-    Paint { shader: sh, anti_alias: true, ..Paint::default() }
 }
 
 fn hgrad(x0: f32, x1: f32, c0: Color, c1: Color) -> Paint<'static> {
@@ -634,12 +686,12 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (m.fps_idx, m.speed.to_bits(), m.transpose, m.tol_ms, m.rate).hash(&mut h);
+    (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
     (m.songs_ver, m.song_sel, m.song_scroll).hash(&mut h);
     if let Some(su) = &m.summary {
-        (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok).hash(&mut h);
+        (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok, su.bpm.map(f64::to_bits)).hash(&mut h);
     }
     h.finish()
 }
@@ -797,33 +849,44 @@ fn ellipsize(cv: &mut Canvas, s: &str, size: f32, max: f32) -> String {
 }
 
 struct VisGeo {
+    /// legend strip above the lanes (static, notes never reach it)
+    legend: R,
     area: R,
     kb: R,
 }
+const LANE_BG: u32 = 0x0C1019;
 fn vis_geo() -> VisGeo {
     let c = VIS_CARD;
     let inner = R::new(c.x + 12.0, c.y + 12.0, c.w - 24.0, c.h - 24.0);
     let kb_h = 92.0;
+    let leg_h = 24.0;
+    let top = inner.y + leg_h + 6.0;
     VisGeo {
+        legend: R::new(inner.x, inner.y, inner.w, leg_h),
         kb: R::new(inner.x, inner.y + inner.h - kb_h, inner.w, kb_h),
-        area: R::new(inner.x, inner.y, inner.w, inner.h - kb_h - 4.0),
+        area: R::new(inner.x, top, inner.w, inner.y + inner.h - kb_h - 4.0 - top),
     }
 }
 
+// Keys are plain rectangles so a lit key is one flat fill over the cached one.
 fn white_key(cv: &mut Canvas, p: u8, kb: &R, c: Color) {
     let (x, w) = key_x(p, kb);
-    cv.rr(x + 0.5, kb.y, w - 1.0, kb.h, 4.0, c);
+    cv.rect(x + 0.5, kb.y, w - 1.0, kb.h, c);
 }
 fn black_key(cv: &mut Canvas, p: u8, kb: &R, c: Color) {
     let (x, w) = key_x(p, kb);
-    cv.rr(x, kb.y - 1.0, w, kb.h * 0.62, 3.0, c);
+    cv.rect(x, kb.y - 1.0, w, kb.h * 0.62, c);
 }
 
 fn visualizer_static(cv: &mut Canvas, _m: &Model) {
     card(cv, VIS_CARD);
-    let VisGeo { area, kb } = vis_geo();
-    let bgp = vgrad(area.y, area.y + area.h, col(0x0A0D14, 1.0), col(0x0F1320, 1.0));
-    cv.rr_paint(area.x, area.y, area.w, area.h + 4.0, 10.0, &bgp);
+    let VisGeo { legend, area, kb } = vis_geo();
+    let mut lx = legend.x + 4.0;
+    for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
+        cv.rr(lx, legend.cy() - 5.0, 10.0, 10.0, 3.0, col(c, a));
+        lx += 16.0 + cv.text(lx + 16.0, legend.cy() - 8.5, 11.5, false, col(SUB, 1.0), t) + 14.0;
+    }
+    cv.rr(area.x, area.y, area.w, area.h + 4.0, 10.0, col(LANE_BG, 1.0));
     for p in 21..=108u8 {
         if !is_black(p) {
             white_key(cv, p, &kb, col(0xE9EDF3, 1.0));
@@ -843,7 +906,7 @@ fn visualizer_static(cv: &mut Canvas, _m: &Model) {
 /// Lane background region that the notes are drawn over (restored from the
 /// static layer every frame, so only notes / lit keys / glow are drawn here).
 fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
-    let VisGeo { area, kb } = vis_geo();
+    let VisGeo { area, kb, .. } = vis_geo();
     for p in (24..=108).step_by(12) {
         let (x, _) = key_x(p, &kb);
         cv.rect(x, area.y + 6.0, 1.0, area.h - 6.0, col(0xFFFFFF, 0.045));
@@ -854,12 +917,10 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
     let mut lit: [Option<u32>; 128] = [None; 128];
 
     if m.vis_on && !m.vis.is_empty() {
-        let v = m.vis.clone();
+        let v = &m.vis;
         let lo = v.partition_point(|n| n.start < now - m.vis_maxdur);
         let hi = v.partition_point(|n| (n.start as f64) < now as f64 + LOOKAHEAD_US);
         let visible = &v[lo..hi];
-        let kept_n = visible.iter().filter(|n| n.kept && n.end >= now).count();
-        let fancy = kept_n < 400; // rounded, shaded notes unless the screen is flooded
         // removed notes: faint ghosts
         for n in visible.iter().filter(|n| !n.kept && n.end >= now) {
             let (x, w) = key_x(n.pitch, &kb);
@@ -885,22 +946,15 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
                 if n.start <= now && now < n.end.max(n.start + 60_000) {
                     lit[n.pitch as usize] = Some(nc);
                 }
+                // flat fill; the 1px gap at the top keeps repeated notes apart
                 let h = (yb - yt).max(4.0);
-                if fancy {
-                    let p = vgrad(yt, yb, col(nc, 0.78), col(nc, 1.0));
-                    cv.rr_paint(x + 1.5, yt, w - 3.0, h, 4.0, &p);
-                } else {
-                    cv.rect(x + 1.5, yt, w - 3.0, h, col(nc, 0.95));
-                    cv.rect(x + 1.5, yt, w - 3.0, h.min(2.0), col(0xFFFFFF, 0.35));
-                }
+                cv.rect(x + 1.5, yt + 1.0, w - 3.0, h - 1.0, col(nc, 1.0));
             }
         }
     }
 
-    // hit line glow
-    let glow = vgrad(hit_y - 18.0, hit_y, col(ACCENT, 0.0), col(ACCENT, 0.35));
-    cv.rr_paint(area.x, hit_y - 18.0, area.w, 18.0, 0.0, &glow);
-    cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 0.9));
+    // hit line
+    cv.rect(area.x, hit_y - 1.5, area.w, 2.0, col(ACCENT, 1.0));
 
     // lit keys over the cached keyboard
     let mut redraw_black = [false; 128];
@@ -938,17 +992,6 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
         cv.rr(area.cx() - 70.0, area.y + 16.0, 140.0, 30.0, 15.0, col(CARD2, 0.95));
         cv.text_c(area.cx(), area.y + 31.0, 13.0, false, col(TEXT, 1.0), "다시 분석 중…");
     }
-    // soft fade where notes enter at the top
-    let fade = vgrad(area.y, area.y + 36.0, col(0x0A0D14, 1.0), col(0x0A0D14, 0.0));
-    cv.rr_paint(area.x, area.y, area.w, 36.0, 0.0, &fade);
-    // legend on a dark pill so notes never cover it
-    let lw: f32 = ["흰건반", "Shift", "Ctrl", "뺀 음"].iter().map(|t| cv.measure(11.5, false, t) + 30.0).sum::<f32>() + 6.0;
-    cv.rr(area.x + 8.0, area.y + 8.0, lw, 24.0, 12.0, col(0x0A0D14, 0.85));
-    let mut lx = area.x + 18.0;
-    for (c, t, a) in [(NOTE_WHITE, "흰건반", 1.0), (NOTE_SHIFT, "Shift", 1.0), (NOTE_CTRL, "Ctrl", 1.0), (0x8A96B4, "뺀 음", 0.35)] {
-        cv.rr(lx, area.y + 15.0, 10.0, 10.0, 3.0, col(c, a));
-        lx += 16.0 + cv.text(lx + 16.0, area.y + 12.0, 11.5, false, col(SUB, 1.0), t) + 14.0;
-    }
 }
 
 fn transport(cv: &mut Canvas, m: &Model) {
@@ -978,7 +1021,7 @@ fn transport(cv: &mut Canvas, m: &Model) {
     // times + seek bar
     let sb = seek_bar();
     let len = m.length_us();
-    let frac = if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 } as f32;
+    let frac = progress(m);
     cv.text_r(sb.x - 14.0, sb.y - 6.0, 13.0, true, col(TEXT, 1.0), &mmss(m.pos_us));
     cv.text(sb.x + sb.w + 14.0, sb.y - 6.0, 13.0, false, col(SUB, 1.0), &mmss(len));
     cv.rr(sb.x, sb.y, sb.w, sb.h, 4.0, col(0x252D3F, 1.0));
@@ -1028,26 +1071,12 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         }
     };
 
-    // FPS segmented
-    label(cv, 0, "Roblox FPS", "");
-    let r0 = seg_rect(0);
-    let n = FPS_CHOICES.len();
-    cv.rr(r0.x - 3.0, r0.y - 3.0, r0.w * n as f32 + 6.0, r0.h + 6.0, 10.0, col(0x0E121B, 1.0));
-    for i in 0..n {
-        let r = seg_rect(i);
-        let sel = m.fps_idx == i;
-        if sel {
-            let p = hgrad(r.x, r.x + r.w, col(ACCENT, la), col(0x9A6BFF, la));
-            cv.rr_paint(r.x, r.y, r.w, r.h, 8.0, &p);
-        } else if m.hover == Some(Wid::Fps(i as u8)) && ed {
-            cv.rr(r.x, r.y, r.w, r.h, 8.0, col(0x222A3B, 1.0));
-        }
-        let t = format!("{}", FPS_CHOICES[i] as u32);
-        cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(if sel { 0xFFFFFF } else { SUB }, la), &t);
-    }
-
-    let rows: [(&str, &str, String, Wid, Wid); 4] = [
-        ("재생 속도", "", format!("{:.2}x", m.speed), Wid::SpeedDn, Wid::SpeedUp),
+    let (speed_label, speed_sub) = match m.base_bpm() {
+        Some(b) => ("템포", format!("원곡 {} BPM", bpm_text(b))),
+        None => ("재생 속도", String::new()),
+    };
+    let rows: [(&str, &str, String, Wid, Wid); 6] = [
+        (speed_label, &speed_sub, m.speed_text(), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
             "허용 지연",
@@ -1060,16 +1089,30 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             Wid::TolUp,
         ),
         (
-            "초당 최대 타건",
+            "최대 타건",
             "Roblox 렉 방지 · 0 = 무제한",
-            if m.rate == 0 { "무제한".into() } else { format!("{}", m.rate) },
+            if m.rate == 0 { "무제한".into() } else { format!("{}회", m.rate) },
             Wid::RateDn,
             Wid::RateUp,
         ),
+        (
+            "제한 구간",
+            "이 시간 안에 최대 타건까지",
+            format!("{} ms", m.rate_win_ms),
+            Wid::WinDn,
+            Wid::WinUp,
+        ),
+        (
+            "사람처럼 연주",
+            "타이밍 오차 · 화음 엇갈림",
+            crate::humanize::LEVEL_NAMES[m.human as usize].into(),
+            Wid::HumanDn,
+            Wid::HumanUp,
+        ),
     ];
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {
-        label(cv, i + 1, t, sub);
-        let (a, b) = stepper_rects(i + 1);
+        label(cv, i, t, sub);
+        let (a, b) = stepper_rects(i);
         for (r, w, minus) in [(a, *dn, true), (b, *up, false)] {
             let hov = m.hover == Some(w) && ed;
             cv.rr(r.x, r.y, r.w, r.h, 9.0, col(if hov { 0x283044 } else { CARD2 }, 1.0));
@@ -1131,12 +1174,12 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 
     let total = (s.kept + s.dropped).max(1);
     let pct = 100.0 * s.kept as f64 / total as f64;
-    let y = c.y + 50.0;
+    let y = c.y + 44.0;
     let w = cv.text(c.x + 20.0, y, 30.0, true, col(TEXT, 1.0), &format!("{pct:.1}"));
     cv.text(c.x + 20.0 + w + 2.0, y + 13.0, 15.0, true, col(SUB, 1.0), "%");
     cv.text(c.x + 20.0 + w + 26.0, y + 15.0, 12.0, false, col(SUB, 1.0), "원래 자리에서 연주되는 음");
     // ratio bar
-    let by = y + 46.0;
+    let by = y + 42.0;
     let bwid = c.w - 40.0;
     cv.rr(c.x + 20.0, by, bwid, 6.0, 3.0, col(0x252D3F, 1.0));
     let p = hgrad(c.x + 20.0, c.x + 20.0 + bwid, col(ACCENT, 1.0), col(ACCENT2, 1.0));
@@ -1151,8 +1194,8 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
     let cw = (c.w - 40.0) / 4.0;
     for (i, (k, v)) in cells.iter().enumerate() {
         let x = c.x + 20.0 + i as f32 * cw;
-        cv.text(x, by + 20.0, 11.0, false, col(DIM, 1.0), k);
-        cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
+        cv.text(x, by + 16.0, 11.0, false, col(DIM, 1.0), k);
+        cv.text(x, by + 32.0, 14.5, true, col(TEXT, 1.0), v);
     }
 }
 
@@ -1160,6 +1203,67 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 mod tests {
     use super::*;
     use crate::library::Row;
+    use crate::schedule::VisNote;
+
+    fn playing(vis: bool) -> Model {
+        let mut m = Model::default();
+        m.state = ST_PLAYING;
+        m.vis_on = vis;
+        m.set_vis(vec![VisNote { start: 0, end: 180_000_000, pitch: 60, kept: true }]);
+        m.summary = Some(Summary { length_us: 180_000_000, ok: true, ..Summary::default() });
+        m
+    }
+
+    #[test]
+    fn frame_key_without_visualizer_follows_shown_time_and_bar() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(false) }, 1.0);
+        // 3-minute song: a few ms moves neither the clock nor the bar
+        assert_eq!(at(10_000_000), at(10_005_000));
+        // the clock ticks over
+        assert_ne!(at(10_990_000), at(11_000_000));
+        // the bar moves by a visible amount
+        assert_ne!(at(10_000_000), at(10_900_000));
+    }
+
+    #[test]
+    fn frame_key_with_visualizer_changes_every_frame() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(true) }, 1.0);
+        assert_ne!(at(10_000_000), at(10_016_000));
+    }
+
+    #[test]
+    fn frame_key_shows_blocked_warning() {
+        let m = playing(false);
+        assert_ne!(frame_key(&m, 1.0), frame_key(&Model { blocked: true, ..playing(false) }, 1.0));
+    }
+
+    #[test]
+    fn single_tempo_song_steps_speed_by_whole_bpm() {
+        let mut m = Model::default();
+        m.summary = Some(Summary { bpm: Some(120.0), ..Summary::default() });
+        assert_eq!(m.speed_text(), "120 BPM");
+        assert!(m.click_setting(Wid::SpeedUp));
+        assert!((m.speed - 121.0 / 120.0).abs() < 1e-12);
+        assert_eq!(m.speed_text(), "121 BPM");
+        m.click_setting(Wid::SpeedDn);
+        m.click_setting(Wid::SpeedDn);
+        assert_eq!(m.speed_text(), "119 BPM");
+        // multi-tempo songs keep the plain multiplier
+        m.summary = Some(Summary { bpm: None, ..Summary::default() });
+        m.speed = 1.0;
+        m.click_setting(Wid::SpeedUp);
+        assert_eq!(m.speed, 1.05);
+        assert_eq!(m.speed_text(), "1.05x");
+    }
+
+    #[test]
+    fn opening_another_song_resets_speed() {
+        let mut m = Model::default();
+        m.speed = 1.1;
+        m.open_song("b.mid".into());
+        assert_eq!(m.speed, 1.0);
+        assert_eq!(m.file_name.as_deref(), Some("b.mid"));
+    }
 
     fn rows(n: usize) -> Vec<Row> {
         let mut v = vec![Row { label: "dir".into(), file: None, entry: 0, kind: RowKind::Folder }];
