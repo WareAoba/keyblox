@@ -112,7 +112,7 @@ fn mod_idx(m: Mod) -> usize {
 
 /// Pair note-ons with note-offs (FIFO per pitch) and merge identical
 /// (same pitch, same instant) notes from layered tracks.
-fn collect_notes(events: &[Ev], end: i64) -> (Vec<Note>, usize, usize) {
+fn collect_notes(events: &[Ev], end: i64, dwell: i64) -> (Vec<Note>, usize, usize) {
     let mut notes: Vec<Note> = vec![];
     let mut open: Vec<std::collections::VecDeque<usize>> = vec![Default::default(); 128];
     let mut n_on = 0;
@@ -151,17 +151,37 @@ fn collect_notes(events: &[Ev], end: i64) -> (Vec<Note>, usize, usize) {
         out.push(n);
     }
     // Within one instant, group notes by modifier state so a chord needs at most
-    // one switch per state. The state the previous instant ended in goes first
-    // (no switch needed), then None, Shift, Ctrl.
+    // one switch per state; the groups after the first are rolled by `dwell` each.
+    // If there is time to switch before the chord, the top note's group goes first
+    // (the melody sounds on time), then the bass note's. Otherwise the state the
+    // previous instant ended in goes first (no switch needed). Then None, Shift, Ctrl.
     let mut i = 0;
     let mut prev_last: Option<Mod> = None;
+    let mut prev_end = NEG; // estimated last strike of the previous instant
     while i < out.len() {
         let mut j = i;
         while j < out.len() && out[j].t == out[i].t {
             j += 1;
         }
+        let t = out[i].t;
+        let hi = out[i..j].iter().max_by_key(|n| n.pitch).unwrap().m;
+        let lo = out[i..j].iter().min_by_key(|n| n.pitch).unwrap().m;
+        let n_groups = {
+            let mut ms = [false; 3];
+            out[i..j].iter().for_each(|n| ms[n.m as usize] = true);
+            ms.iter().filter(|&&b| b).count() as i64
+        };
+        let next_t = out.get(j).map_or(i64::MAX, |n| n.t);
+        // room to switch before the chord, and to settle before the next one
+        let free = t - prev_end >= dwell && next_t - (t + (n_groups - 1) * dwell) >= dwell;
         let pl = prev_last;
-        out[i..j].sort_by_key(|n| (if Some(n.m) == pl { 0 } else { 1 + n.m as u8 }, n.pitch));
+        out[i..j].sort_by_key(|n| {
+            let g = if free {
+                if n.m == hi { 0 } else if n.m == lo { 1 } else { 2 + n.m as u8 }
+            } else if Some(n.m) == pl { 0 } else { 1 + n.m as u8 };
+            (g, n.pitch)
+        });
+        prev_end = t + (n_groups - 1) * dwell;
         prev_last = Some(out[j - 1].m);
         i = j;
     }
@@ -331,7 +351,7 @@ impl Gen {
 
 pub fn build(events: &[Ev], p: Params) -> Schedule {
     let end = events.last().map(|e| e.t).unwrap_or(0);
-    let (notes, n_on, merged) = collect_notes(events, end);
+    let (notes, n_on, merged) = collect_notes(events, end, p.dwell);
     let path = choose(&notes, p);
     let path = limit_rate(&notes, path, p.max_rate);
 
@@ -617,6 +637,31 @@ mod tests {
         let ev = sorted(vec![on(0, 60), on(0, 61), on(0, 64), off(500_000, 60), off(500_000, 61), off(500_000, 64)]);
         let s = check(&ev, P);
         assert_eq!((s.strikes, s.dropped), (3, 0));
+    }
+
+    /// A mixed chord after a rest: the top note (melody) sounds on time and the
+    /// roll goes to the lower notes, even if the previous state favours them.
+    #[test]
+    fn mixed_chord_after_rest_puts_melody_on_time() {
+        // white C4 (state None), then 500 ms later white C3 + E3 under black C#5
+        let ev = sorted(vec![on(0, 60), off(100_000, 60), on(500_000, 48), on(500_000, 52), on(500_000, 73),
+            off(900_000, 48), off(900_000, 52), off(900_000, 73)]);
+        let s = check(&ev, P);
+        assert_eq!(s.dropped, 0);
+        let t73 = s.actions.iter().find(|a| matches!(a.note, Some((73, _)))).unwrap().t;
+        assert_eq!(t73, 500_000, "melody struck late");
+    }
+
+    /// When the chord follows too closely to switch first, keep the old order
+    /// (previous state first) instead of losing notes.
+    #[test]
+    fn mixed_chord_right_after_notes_keeps_previous_state_first() {
+        // white C4 at 0, chord C3 + C#5 only 5 ms later: no time to switch first
+        let ev = sorted(vec![on(0, 60), off(4_000, 60), on(5_000, 48), on(5_000, 73), off(300_000, 48), off(300_000, 73)]);
+        let s = check(&ev, P);
+        assert_eq!(s.dropped, 0);
+        let t48 = s.actions.iter().find(|a| matches!(a.note, Some((48, _)))).unwrap().t;
+        assert_eq!(t48, 5_000);
     }
 
     #[test]
