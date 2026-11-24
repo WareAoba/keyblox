@@ -13,13 +13,15 @@ pub struct Settings {
     pub hold: Option<f64>,
     pub gap: Option<f64>,
     pub tolerance: Option<f64>,
-    /// strikes per second cap (None = default, 0 = unlimited)
-    pub max_rate: Option<f64>,
+    /// strike cap per window (None = default, 0 = unlimited)
+    pub rate_count: Option<usize>,
+    /// window for `rate_count` in ms (None = default)
+    pub rate_window: Option<f64>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, max_rate: None }
+        Settings { speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, rate_count: None, rate_window: None }
     }
 }
 
@@ -66,7 +68,8 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         hold: ms(st.hold, base.hold),
         gap: ms(st.gap, base.gap),
         tolerance: ms(st.tolerance, base.tolerance),
-        max_rate: st.max_rate.unwrap_or(base.max_rate).max(0.0),
+        rate_count: st.rate_count.unwrap_or(base.rate_count),
+        rate_window: ms(st.rate_window, base.rate_window),
     };
     let t0 = std::time::Instant::now();
     let s = schedule::build(&parsed.events, p);
@@ -79,9 +82,9 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     r.push(format!("템포 메타 이벤트: {}개 (모두 반영)", parsed.tempo_changes));
     r.push(if st.pedal { format!("페달: {}회 변화 -> 스페이스", parsed.pedal_changes) } else { "페달: 끔".into() });
     r.push(format!(
-        "규칙: Shift/Ctrl 전환 간격 {:.1}ms, 허용 지연 {:.1}ms, 초당 최대 타건 {}",
+        "규칙: Shift/Ctrl 전환 간격 {:.1}ms, 허용 지연 {:.1}ms, 최대 타건 {}",
         p.dwell as f64 / 1e3, p.tolerance as f64 / 1e3,
-        if p.max_rate > 0.0 { format!("{:.0}", p.max_rate) } else { "제한 없음".into() }
+        if p.rate_count > 0 { format!("{}회 / {:.0}ms", p.rate_count, p.rate_window as f64 / 1e3) } else { "제한 없음".into() }
     ));
     let kept = 100.0 * s.strikes as f64 / (s.strikes + s.dropped).max(1) as f64;
     r.push(format!(
