@@ -589,13 +589,32 @@ pub fn frame_key(m: &Model, scale: f32) -> i64 {
         let bar = (seek_bar().w * progress(m) * scale * 4.0).round() as i64;
         (m.pos_us.max(0) / 1_000_000) << 24 | bar
     };
-    let count = if m.state == ST_COUNT { count_digit(m) } else { 0 };
-    (shown << 1 | m.blocked as i64) << 4 | count
+    (shown << 1 | m.blocked as i64) << 4 | count_digit(m)
 }
 
-/// Whole seconds shown while counting down (3, 2, 1).
-fn count_digit(m: &Model) -> i64 {
+/// Whole seconds shown while counting down (3, 2, 1); 0 when not counting.
+pub fn count_digit(m: &Model) -> i64 {
+    if m.state != ST_COUNT {
+        return 0;
+    }
     (m.count_left_us.max(0) + 999_999) / 1_000_000
+}
+
+/// Side of the countdown badge shown over the Roblox window (logical px).
+pub const BADGE: f32 = 132.0;
+
+/// The countdown badge on its own transparent pixmap (premultiplied RGBA),
+/// drawn with this canvas' fonts and scale.
+pub fn render_badge(cv: &mut Canvas, digit: i64) -> Pixmap {
+    let side = (BADGE * cv.s).round() as u32;
+    let mut pm = Pixmap::new(side, side).unwrap();
+    std::mem::swap(&mut cv.pm, &mut pm);
+    let c = BADGE / 2.0;
+    cv.circle(c, c, c - 1.0, &hgrad(0.0, BADGE, col(ACCENT, 0.95), col(0x9A6BFF, 0.95)));
+    cv.circle(c, c, c - 5.0, &solid(col(CARD2, 0.92)));
+    cv.text_c(c, c + 2.0, 64.0, true, col(TEXT, 1.0), &digit.to_string());
+    std::mem::swap(&mut cv.pm, &mut pm);
+    pm
 }
 
 // ---------------------------------------------------------------- canvas
@@ -1489,6 +1508,21 @@ mod tests {
         let at = |left: i64| frame_key(&Model { state: ST_COUNT, count_left_us: left, ..playing(false) }, 1.0);
         assert_eq!(at(2_400_000), at(2_100_000));
         assert_ne!(at(2_001_000), at(2_000_000)); // 3 -> 2
+    }
+
+    #[test]
+    fn countdown_badge_is_see_through_outside_the_circle() {
+        let reg = std::fs::read("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc");
+        let bold = std::fs::read("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc");
+        let (Ok(reg), Ok(bold)) = (reg, bold) else { return }; // fonts not installed
+        let mut cv = Canvas::new(1.0, Fonts::load(&reg, 1, &bold, 1).unwrap());
+        let pm = render_badge(&mut cv, 3);
+        let side = pm.width();
+        let alpha = |x: u32, y: u32| pm.data()[((y * side + x) * 4 + 3) as usize];
+        assert_eq!(alpha(0, 0), 0); // corners let Roblox show through
+        assert!(alpha(side / 2, 8) > 200);
+        assert_ne!(render_badge(&mut cv, 3).data(), render_badge(&mut cv, 2).data());
+        assert_eq!(cv.pm.width(), (W as u32)); // the window canvas is left alone
     }
 
     #[test]

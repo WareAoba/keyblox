@@ -78,6 +78,9 @@ fn main() {
             let (r, t) = args[i + 1].split_once(':').unwrap();
             m.edit = Some(ui::Edit { row: r.parse().unwrap(), text: t.trim_start_matches('*').into(), fresh: t.starts_with('*') });
         }
+        if let Some(i) = args.iter().position(|a| a == "--badge") {
+            ui::render_badge(&mut cv, 3).save_png(&args[i + 1]).unwrap();
+        }
         let t0 = std::time::Instant::now();
         let n = 30;
         for k in 0..n { m.pos_us = (at * 1e6) as i64 + k * 16_666; ui::render(&mut cv, &m); }
