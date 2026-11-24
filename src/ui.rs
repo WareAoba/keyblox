@@ -388,18 +388,6 @@ fn solid(c: Color) -> Paint<'static> {
     Paint { shader: Shader::SolidColor(c), anti_alias: true, ..Paint::default() }
 }
 
-fn vgrad(y0: f32, y1: f32, c0: Color, c1: Color) -> Paint<'static> {
-    let sh = LinearGradient::new(
-        Point::from_xy(0.0, y0),
-        Point::from_xy(0.0, y1),
-        vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or(Shader::SolidColor(c0));
-    Paint { shader: sh, anti_alias: true, ..Paint::default() }
-}
-
 fn hgrad(x0: f32, x1: f32, c0: Color, c1: Color) -> Paint<'static> {
     let sh = LinearGradient::new(
         Point::from_xy(x0, 0.0),
