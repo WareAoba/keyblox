@@ -6,6 +6,7 @@
 
 use crate::analyze::{Settings, Summary};
 use crate::layout::{key_for, Mod};
+use crate::library::{Row, RowKind};
 use crate::schedule::VisNote;
 use fontdue::{Font, FontSettings, Metrics};
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ use tiny_skia::{
     SpreadMode, Stroke, Transform,
 };
 
-pub const W: f32 = 1120.0;
+pub const W: f32 = 1120.0 + SIDE_W + M;
 pub const H: f32 = 700.0;
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
@@ -81,6 +82,12 @@ pub enum Wid {
     Drums,
     Roblox,
     Vis,
+    AddFile,
+    AddFolder,
+    /// a playable row in the song list (row index)
+    Song(usize),
+    /// the remove button of a file row or folder header (row index)
+    SongDel(usize),
 }
 
 pub struct Model {
@@ -108,6 +115,13 @@ pub struct Model {
     pub blocked: bool,
     pub hover: Option<Wid>,
     pub pressed: Option<Wid>,
+    /// sidebar rows (set with `set_songs`)
+    pub songs: Vec<Row>,
+    songs_ver: u64,
+    /// row index of the open file
+    pub song_sel: Option<usize>,
+    /// first visible row
+    pub song_scroll: usize,
 }
 
 impl Default for Model {
@@ -134,6 +148,10 @@ impl Default for Model {
             blocked: false,
             hover: None,
             pressed: None,
+            songs: vec![],
+            songs_ver: 0,
+            song_sel: None,
+            song_scroll: 0,
         }
     }
 }
@@ -234,6 +252,16 @@ impl Model {
             None => format!("{:.2}x", self.speed),
         }
     }
+    pub fn set_songs(&mut self, rows: Vec<Row>) {
+        self.songs = rows;
+        self.songs_ver += 1;
+        self.scroll_songs(0);
+    }
+    /// Scroll the song list by `rows` (negative = up), clamped.
+    pub fn scroll_songs(&mut self, rows: i32) {
+        let max = self.songs.len().saturating_sub(list_rows());
+        self.song_scroll = (self.song_scroll as i64 + rows as i64).clamp(0, max as i64) as usize;
+    }
     pub fn length_us(&self) -> i64 {
         self.summary.as_ref().map(|s| s.length_us).unwrap_or(0)
     }
@@ -267,9 +295,17 @@ impl R {
 }
 
 const M: f32 = 20.0;
+const SIDE_W: f32 = 220.0;
 const RIGHT_W: f32 = 340.0;
-const VIS_CARD: R = R::new(M, 72.0, W - M * 3.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
-const TRANSPORT: R = R::new(M, H - M - 84.0, W - M * 3.0 - RIGHT_W, 84.0);
+/// left edge of the main column (right of the song list)
+const X0: f32 = M + SIDE_W + M;
+const SIDE_CARD: R = R::new(M, 72.0, SIDE_W, H - 72.0 - M);
+const ADD_FILE_BTN: R = R::new(SIDE_CARD.x + 14.0, SIDE_CARD.y + 50.0, (SIDE_W - 28.0 - 8.0) / 2.0, 30.0);
+const ADD_DIR_BTN: R = R::new(ADD_FILE_BTN.x + ADD_FILE_BTN.w + 8.0, ADD_FILE_BTN.y, ADD_FILE_BTN.w, 30.0);
+const LIST: R = R::new(SIDE_CARD.x + 8.0, SIDE_CARD.y + 94.0, SIDE_W - 16.0, SIDE_CARD.h - 94.0 - 10.0);
+const LIST_ROW_H: f32 = 30.0;
+const VIS_CARD: R = R::new(X0, 72.0, W - X0 - M * 2.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
+const TRANSPORT: R = R::new(X0, H - M - 84.0, W - X0 - M * 2.0 - RIGHT_W, 84.0);
 const SET_H: f32 = 454.0;
 const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
 const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
@@ -293,13 +329,33 @@ fn stepper_rects(row: usize) -> (R, R) {
     let right = SET_CARD.x + SET_CARD.w - 18.0;
     (R::new(right - 124.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
 }
+fn list_rows() -> usize {
+    (LIST.h / LIST_ROW_H) as usize
+}
+/// Rect of sidebar row `i` given the scroll, if it is visible.
+fn song_rect(m: &Model, i: usize) -> Option<R> {
+    let k = i.checked_sub(m.song_scroll).filter(|&k| k < list_rows())?;
+    Some(R::new(LIST.x, LIST.y + k as f32 * LIST_ROW_H, LIST.w, LIST_ROW_H))
+}
+fn song_del_rect(r: &R) -> R {
+    R::new(r.x + r.w - 28.0, r.y + 4.0, 22.0, 22.0)
+}
 fn toggle_row(i: usize) -> R {
     R::new(SET_CARD.x + 8.0, TOG0 + i as f32 * TOG_H, SET_CARD.w - 16.0, TOG_H)
 }
 
 /// Every clickable thing and where it is.
-pub fn widgets() -> Vec<(R, Wid)> {
-    let mut v = vec![(OPEN_BTN, Wid::Open)];
+pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
+    let mut v = vec![(OPEN_BTN, Wid::Open), (ADD_FILE_BTN, Wid::AddFile), (ADD_DIR_BTN, Wid::AddFolder)];
+    for (i, row) in m.songs.iter().enumerate() {
+        let Some(r) = song_rect(m, i) else { continue };
+        if row.kind != RowKind::InFolder {
+            v.push((song_del_rect(&r), Wid::SongDel(i)));
+        }
+        if row.file.is_some() {
+            v.push((r, Wid::Song(i)));
+        }
+    }
     let (px, py, pr) = play_btn();
     v.push((R::new(px - pr, py - pr, pr * 2.0, pr * 2.0), Wid::Play));
     let (sx, sy, sr) = stop_btn();
@@ -325,8 +381,12 @@ pub fn widgets() -> Vec<(R, Wid)> {
     v
 }
 
-pub fn hit(x: f32, y: f32) -> Option<Wid> {
-    widgets().into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, w)| w)
+pub fn in_song_list(x: f32, y: f32) -> bool {
+    SIDE_CARD.contains(x, y)
+}
+
+pub fn hit(m: &Model, x: f32, y: f32) -> Option<Wid> {
+    widgets(m).into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, w)| w)
 }
 
 /// Seek position (0..1) for a mouse x over the seek bar.
@@ -629,6 +689,7 @@ fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
+    (m.songs_ver, m.song_sel, m.song_scroll).hash(&mut h);
     if let Some(su) = &m.summary {
         (su.kept, su.dropped, su.tempo_changes, su.max_late_us, su.ok, su.bpm.map(f64::to_bits)).hash(&mut h);
     }
@@ -652,6 +713,7 @@ pub fn render(cv: &mut Canvas, m: &Model) {
 fn render_static(cv: &mut Canvas, m: &Model) {
     cv.pm.fill(col(BG, 1.0));
     header(cv, m);
+    song_list(cv, m);
     visualizer_static(cv, m);
     card(cv, TRANSPORT);
     settings_card(cv, m);
@@ -690,6 +752,84 @@ fn header(cv: &mut Canvas, m: &Model) {
     cv.rr_stroke(x + 0.5, b.y + 3.5, w - 1.0, b.h - 7.0, 16.0, col(BORDER, 1.0), 1.0);
     cv.circle(x + 18.0, b.cy(), 4.0, &solid(col(if m.file_name.is_some() { GREEN } else { DIM }, 1.0)));
     cv.text(x + 30.0, b.y + 10.0, 13.0, false, col(if m.file_name.is_some() { TEXT } else { SUB }, 1.0), &name);
+}
+
+fn small_btn(cv: &mut Canvas, r: R, hov: bool, label: &str) {
+    cv.rr(r.x, r.y, r.w, r.h, 9.0, col(if hov { 0x283044 } else { CARD2 }, 1.0));
+    cv.rr_stroke(r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 1.0, 9.0, col(BORDER, 1.0), 1.0);
+    cv.text_c(r.cx(), r.cy() + 1.0, 12.5, true, col(TEXT, 0.92), label);
+}
+
+fn folder_icon(cv: &mut Canvas, x: f32, y: f32, c: Color) {
+    cv.rr(x, y, 6.0, 3.0, 1.0, c);
+    cv.rr(x, y + 2.0, 13.0, 9.0, 2.0, c);
+}
+
+fn song_list(cv: &mut Canvas, m: &Model) {
+    let c = SIDE_CARD;
+    card(cv, c);
+    cv.text(c.x + 18.0, c.y + 18.0, 15.0, true, col(TEXT, 1.0), "곡 목록");
+    let n = m.songs.iter().filter(|r| r.file.is_some()).count();
+    if n > 0 {
+        cv.text_r(c.x + c.w - 18.0, c.y + 21.0, 11.5, false, col(DIM, 1.0), &format!("{}곡", thousands(n)));
+    }
+    small_btn(cv, ADD_FILE_BTN, m.hover == Some(Wid::AddFile), "+ 파일");
+    small_btn(cv, ADD_DIR_BTN, m.hover == Some(Wid::AddFolder), "+ 폴더");
+
+    if m.songs.is_empty() {
+        let y = LIST.y + 40.0;
+        cv.text_c(LIST.cx(), y, 12.5, false, col(SUB, 1.0), "목록이 비어 있습니다");
+        cv.text_c(LIST.cx(), y + 22.0, 11.5, false, col(DIM, 1.0), "파일이나 폴더를 창에");
+        cv.text_c(LIST.cx(), y + 40.0, 11.5, false, col(DIM, 1.0), "끌어다 놓아도 됩니다");
+        return;
+    }
+    for (i, row) in m.songs.iter().enumerate() {
+        let Some(r) = song_rect(m, i) else { continue };
+        let hov = matches!(m.hover, Some(Wid::Song(k) | Wid::SongDel(k)) if k == i);
+        let sel = m.song_sel == Some(i);
+        if sel {
+            cv.rr(r.x, r.y + 1.0, r.w, r.h - 2.0, 8.0, col(ACCENT, 0.22));
+            cv.rr(r.x, r.y + 7.0, 3.0, r.h - 14.0, 1.5, col(ACCENT, 1.0));
+        } else if hov && row.file.is_some() {
+            cv.rr(r.x, r.y + 1.0, r.w, r.h - 2.0, 8.0, col(CARD2, 1.0));
+        }
+        let del = hov && row.kind != RowKind::InFolder;
+        let right = r.x + r.w - if del { 32.0 } else { 10.0 };
+        let ty = r.y + 7.0;
+        match row.kind {
+            RowKind::Folder => {
+                folder_icon(cv, r.x + 10.0, r.y + 10.0, col(AMBER, 0.85));
+                let x = r.x + 30.0;
+                let t = ellipsize(cv, &row.label, 12.5, right - x);
+                cv.text(x, ty, 12.5, false, col(SUB, 1.0), &t);
+            }
+            RowKind::File | RowKind::InFolder => {
+                let x = r.x + if row.kind == RowKind::InFolder { 30.0 } else { 14.0 };
+                let dot = if sel { ACCENT } else { DIM };
+                cv.circle(x + 2.5, r.cy(), 2.5, &solid(col(dot, 1.0)));
+                let tx = x + 12.0;
+                let t = ellipsize(cv, &row.label, 12.5, right - tx);
+                cv.text(tx, ty, 12.5, false, col(if sel { TEXT } else { 0xC5CCD9 }, 1.0), &t);
+            }
+        }
+        if del {
+            let d = song_del_rect(&r);
+            let on = m.hover == Some(Wid::SongDel(i));
+            if on {
+                cv.rr(d.x, d.y, d.w, d.h, 6.0, col(RED, 0.18));
+            }
+            cv.text_c(d.cx(), d.cy() + 0.5, 14.0, false, col(if on { RED } else { SUB }, 1.0), "×");
+        }
+    }
+    // scroll bar
+    let vis = list_rows();
+    if m.songs.len() > vis {
+        let track = LIST.h - 8.0;
+        let h = (track * vis as f32 / m.songs.len() as f32).max(24.0);
+        let max = (m.songs.len() - vis) as f32;
+        let y = LIST.y + 4.0 + (track - h) * m.song_scroll as f32 / max;
+        cv.rr(c.x + c.w - 6.0, y, 3.0, h, 1.5, col(0xFFFFFF, 0.14));
+    }
 }
 
 fn ellipsize(cv: &mut Canvas, s: &str, size: f32, max: f32) -> String {
@@ -1062,6 +1202,7 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::Row;
     use crate::schedule::VisNote;
 
     fn playing(vis: bool) -> Model {
@@ -1122,5 +1263,43 @@ mod tests {
         m.open_song("b.mid".into());
         assert_eq!(m.speed, 1.0);
         assert_eq!(m.file_name.as_deref(), Some("b.mid"));
+    }
+
+    fn rows(n: usize) -> Vec<Row> {
+        let mut v = vec![Row { label: "dir".into(), file: None, entry: 0, kind: RowKind::Folder }];
+        for i in 1..n {
+            v.push(Row { label: format!("s{i}"), file: Some(format!("s{i}.mid").into()), entry: 0, kind: RowKind::InFolder });
+        }
+        v
+    }
+
+    #[test]
+    fn song_rows_hit_by_scroll_position() {
+        let mut m = Model::default();
+        m.set_songs(rows(40));
+        let x = LIST.x + 40.0;
+        // folder header: not playable, only its remove button is clickable
+        assert_eq!(hit(&m, x, LIST.y + 5.0), None);
+        let d = song_del_rect(&song_rect(&m, 0).unwrap());
+        assert_eq!(hit(&m, d.cx(), d.cy()), Some(Wid::SongDel(0)));
+        assert_eq!(hit(&m, x, LIST.y + LIST_ROW_H * 2.0 + 5.0), Some(Wid::Song(2)));
+        // rows inside a folder have no remove button
+        let d = song_del_rect(&song_rect(&m, 2).unwrap());
+        assert_eq!(hit(&m, d.cx(), d.cy()), Some(Wid::Song(2)));
+        m.scroll_songs(3);
+        assert_eq!(hit(&m, x, LIST.y + 5.0), Some(Wid::Song(3)));
+    }
+
+    #[test]
+    fn song_scroll_is_clamped() {
+        let mut m = Model::default();
+        m.set_songs(rows(40));
+        m.scroll_songs(-5);
+        assert_eq!(m.song_scroll, 0);
+        m.scroll_songs(1000);
+        assert_eq!(m.song_scroll, 40 - list_rows());
+        // a shorter list pulls the scroll back
+        m.set_songs(rows(3));
+        assert_eq!(m.song_scroll, 0);
     }
 }

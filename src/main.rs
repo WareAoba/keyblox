@@ -3,6 +3,7 @@
 mod analyze;
 mod humanize;
 mod layout;
+mod library;
 mod midi;
 mod schedule;
 mod ui;
@@ -60,6 +61,14 @@ fn main() {
         m.pos_us = (at * 1e6) as i64;
         m.state = if at > 0.0 { ui::ST_PLAYING } else { ui::ST_STOPPED };
         if args.iter().any(|a| a == "--hover-play") { m.hover = Some(ui::Wid::Play); }
+        if let Some(i) = args.iter().position(|a| a == "--songs") {
+            let mut lib = library::Library::default();
+            for p in args[i + 1].split(',') { lib.add(p.into(), std::path::Path::new(p).is_dir()); }
+            let rows = lib.rows();
+            m.song_sel = rows.iter().position(|r| r.file.as_deref() == Some(std::path::Path::new(path)));
+            m.set_songs(rows);
+            if let Some(h) = val("--hover-song") { m.hover = Some(ui::Wid::SongDel(h as usize)); }
+        }
         if args.iter().any(|a| a == "--novis") { m.vis_on = false; }
         let t0 = std::time::Instant::now();
         let n = 30;
