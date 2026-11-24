@@ -335,6 +335,32 @@ pub fn seek_fraction(x: f32) -> f64 {
     (((x - sb.x) / sb.w) as f64).clamp(0.0, 1.0)
 }
 
+/// The part of the window that changes while a song plays (visualizer and
+/// transport). Everything else comes from the static layer.
+pub fn dynamic_rect() -> R {
+    R::new(VIS_CARD.x, VIS_CARD.y, VIS_CARD.w.max(TRANSPORT.w), TRANSPORT.y + TRANSPORT.h - VIS_CARD.y)
+}
+
+/// Seek bar fill as a fraction of the song.
+fn progress(m: &Model) -> f32 {
+    let len = m.length_us();
+    (if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 }) as f32
+}
+
+/// Changes exactly when the moving part of the frame would look different:
+/// every position while falling notes are shown, otherwise only when the
+/// clock or the seek bar (in quarter device pixels) moves, or the input-blocked
+/// warning appears.
+pub fn frame_key(m: &Model, scale: f32) -> i64 {
+    let shown = if m.vis_on && !m.vis.is_empty() {
+        m.pos_us
+    } else {
+        let bar = (seek_bar().w * progress(m) * scale * 4.0).round() as i64;
+        (m.pos_us.max(0) / 1_000_000) << 24 | bar
+    };
+    shown << 1 | m.blocked as i64
+}
+
 // ---------------------------------------------------------------- canvas
 pub struct Fonts {
     regular: Font,
@@ -855,7 +881,7 @@ fn transport(cv: &mut Canvas, m: &Model) {
     // times + seek bar
     let sb = seek_bar();
     let len = m.length_us();
-    let frac = if len > 0 { (m.pos_us as f64 / len as f64).clamp(0.0, 1.0) } else { 0.0 } as f32;
+    let frac = progress(m);
     cv.text_r(sb.x - 14.0, sb.y - 6.0, 13.0, true, col(TEXT, 1.0), &mmss(m.pos_us));
     cv.text(sb.x + sb.w + 14.0, sb.y - 6.0, 13.0, false, col(SUB, 1.0), &mmss(len));
     cv.rr(sb.x, sb.y, sb.w, sb.h, 4.0, col(0x252D3F, 1.0));
@@ -1036,6 +1062,39 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::VisNote;
+
+    fn playing(vis: bool) -> Model {
+        let mut m = Model::default();
+        m.state = ST_PLAYING;
+        m.vis_on = vis;
+        m.set_vis(vec![VisNote { start: 0, end: 180_000_000, pitch: 60, kept: true }]);
+        m.summary = Some(Summary { length_us: 180_000_000, ok: true, ..Summary::default() });
+        m
+    }
+
+    #[test]
+    fn frame_key_without_visualizer_follows_shown_time_and_bar() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(false) }, 1.0);
+        // 3-minute song: a few ms moves neither the clock nor the bar
+        assert_eq!(at(10_000_000), at(10_005_000));
+        // the clock ticks over
+        assert_ne!(at(10_990_000), at(11_000_000));
+        // the bar moves by a visible amount
+        assert_ne!(at(10_000_000), at(10_900_000));
+    }
+
+    #[test]
+    fn frame_key_with_visualizer_changes_every_frame() {
+        let at = |us: i64| frame_key(&Model { pos_us: us, ..playing(true) }, 1.0);
+        assert_ne!(at(10_000_000), at(10_016_000));
+    }
+
+    #[test]
+    fn frame_key_shows_blocked_warning() {
+        let m = playing(false);
+        assert_ne!(frame_key(&m, 1.0), frame_key(&Model { blocked: true, ..playing(false) }, 1.0));
+    }
 
     #[test]
     fn single_tempo_song_steps_speed_by_whole_bpm() {
@@ -1065,4 +1124,3 @@ mod tests {
         assert_eq!(m.file_name.as_deref(), Some("b.mid"));
     }
 }
-

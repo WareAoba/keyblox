@@ -34,6 +34,7 @@ struct App {
     file: Option<String>,
     gen: u64,
     tracking: bool,
+    /// what the last painted frame showed: (state, ui::frame_key, analyzing, hover)
     last_frame: (u8, i64, bool, Option<Wid>),
     dirty: bool,
 }
@@ -192,7 +193,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     hdc, 0, 0, wd as u32, ht as u32, 0, 0, 0, ht as u32,
                     a.cv.pm.data().as_ptr() as *const _, &bi, DIB_RGB_COLORS,
                 );
-                a.last_frame = (a.model.state, a.model.pos_us, a.model.analyzing, a.model.hover);
+                a.last_frame = (a.model.state, ui::frame_key(&a.model, a.cv.s), a.model.analyzing, a.model.hover);
                 a.dirty = false;
             });
             EndPaint(hwnd, &ps);
@@ -205,10 +206,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 m.state = player::state();
                 m.pos_us = player::position_us().min(m.length_us().max(0));
                 m.blocked = player::input_blocked();
-                let animating = m.state == ui::ST_PLAYING && m.vis_on;
-                let changed = a.last_frame != (m.state, m.pos_us, m.analyzing, m.hover);
-                if animating || changed || a.dirty {
+                if IsIconic(hwnd) != 0 {
+                    return; // nothing to show; restoring repaints the whole window
+                }
+                let key = ui::frame_key(m, a.cv.s);
+                let (st, _, an, hv) = a.last_frame;
+                if a.dirty || (st, an, hv) != (m.state, m.analyzing, m.hover) {
                     invalidate(hwnd);
+                } else if key != a.last_frame.1 {
+                    // only the visualizer / transport moved: repaint just that part
+                    let r = ui::dynamic_rect();
+                    let s = a.cv.s;
+                    let rc = RECT {
+                        left: (r.x * s).floor() as i32,
+                        top: (r.y * s).floor() as i32,
+                        right: ((r.x + r.w) * s).ceil() as i32,
+                        bottom: ((r.y + r.h) * s).ceil() as i32,
+                    };
+                    InvalidateRect(hwnd, &rc, 0);
                 }
             });
             0
