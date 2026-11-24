@@ -4,7 +4,6 @@ use crate::{midi, schedule};
 
 #[derive(Clone, Copy)]
 pub struct Settings {
-    pub fps: f64,
     pub speed: f64,
     pub transpose: i32,
     pub pedal: bool,
@@ -22,7 +21,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { fps: 60.0, speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, rate_count: None, rate_window: None }
+        Settings { speed: 1.0, transpose: 0, pedal: true, drums: false, dwell: None, hold: None, gap: None, tolerance: None, rate_count: None, rate_window: None }
     }
 }
 
@@ -62,7 +61,7 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         speed: st.speed.clamp(0.1, 10.0),
     };
     let parsed = midi::parse(bytes, &opt)?;
-    let base = schedule::Params::from_fps(st.fps.clamp(10.0, 1000.0));
+    let base = schedule::Params::default();
     let ms = |v: Option<f64>, d: i64| v.map(|x| (x * 1000.0).round() as i64).unwrap_or(d).max(0);
     let p = schedule::Params {
         dwell: ms(st.dwell, base.dwell),
@@ -83,8 +82,8 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     r.push(format!("템포 메타 이벤트: {}개 (모두 반영)", parsed.tempo_changes));
     r.push(if st.pedal { format!("페달: {}회 변화 -> 스페이스", parsed.pedal_changes) } else { "페달: 끔".into() });
     r.push(format!(
-        "규칙: Shift/Ctrl 전환 간격 {:.1}ms ({}fps), 허용 지연 {:.1}ms, 최대 타건 {}",
-        p.dwell as f64 / 1e3, st.fps, p.tolerance as f64 / 1e3,
+        "규칙: Shift/Ctrl 전환 간격 {:.1}ms, 허용 지연 {:.1}ms, 최대 타건 {}",
+        p.dwell as f64 / 1e3, p.tolerance as f64 / 1e3,
         if p.rate_count > 0 { format!("{}회 / {:.0}ms", p.rate_count, p.rate_window as f64 / 1e3) } else { "제한 없음".into() }
     ));
     let kept = 100.0 * s.strikes as f64 / (s.strikes + s.dropped).max(1) as f64;
