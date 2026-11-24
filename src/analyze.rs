@@ -77,19 +77,22 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     let t0 = std::time::Instant::now();
     let human = humanize::level(st.human);
     let humanized;
+    let mut slips = humanize::Slips::default();
     let events = match human {
         Some(h) => {
-            humanized = humanize::apply(&parsed.events, h);
+            (humanized, slips) = humanize::apply(&parsed.events, h);
             &humanized
         }
         None => &parsed.events,
     };
+    // rubato changes the length a little
+    let length_us = events.last().map(|e| e.t).unwrap_or(parsed.length_us);
     let s = schedule::build(events, p);
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let verdict = schedule::verify(&s.actions, p);
 
     let mut r = vec![];
-    r.push(format!("길이: {}   (속도 x{})", mmss(parsed.length_us), opt.speed));
+    r.push(format!("길이: {}   (속도 x{})", mmss(length_us), opt.speed));
     r.push(format!("음표: {}개   (88키 밖이라 옥타브 이동 {}개)", parsed.notes, parsed.folded));
     r.push(match parsed.bpm {
         Some(b) => format!("템포 메타 이벤트: {}개 (단일 템포 {:.1} BPM)", parsed.tempo_changes, b),
@@ -103,9 +106,10 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
     ));
     if let Some(h) = human {
         r.push(format!(
-            "사람처럼 연주: {} (타이밍 오차 표준편차 {:.0}ms, 화음 엇갈림 최대 {:.0}ms, 아래 지연은 이 시각 기준)",
-            humanize::LEVEL_NAMES[st.human as usize], h.jitter as f64 / 1e3, h.lead as f64 / 1e3
+            "사람처럼 연주: {} (타이밍 오차 표준편차 {:.0}ms, 화음 엇갈림 최대 {:.0}ms, 템포 흔들림 최대 {:.0}%, 아래 지연은 이 시각 기준)",
+            humanize::LEVEL_NAMES[st.human as usize], h.jitter as f64 / 1e3, h.lead as f64 / 1e3, h.rubato * 100.0
         ));
+        r.push(format!("삑사리: 놓친 음 {}개, 옆 건반 같이 누름 {}개, 옆 건반 잘못 누름 {}개", slips.missed, slips.grazed, slips.wrong));
     }
     let kept = 100.0 * s.strikes as f64 / (s.strikes + s.dropped).max(1) as f64;
     r.push(format!(
@@ -129,10 +133,10 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         dropped: s.dropped,
         tempo_changes: parsed.tempo_changes,
         pedal_changes: parsed.pedal_changes,
-        length_us: parsed.length_us,
+        length_us,
         max_late_us: s.max_late,
         ok,
         bpm: parsed.bpm,
     };
-    Ok(Analysis { schedule: s, report: r, length_us: parsed.length_us, ok, summary })
+    Ok(Analysis { schedule: s, report: r, length_us, ok, summary })
 }
