@@ -48,6 +48,7 @@ static OWN_HWND: AtomicUsize = AtomicUsize::new(0);
 static ACTIONS: Mutex<Option<Arc<Vec<Action>>>> = Mutex::new(None);
 static ORIGIN_US: AtomicI64 = AtomicI64::new(0); // song start, in us since EPOCH
 static SEEK_US: AtomicI64 = AtomicI64::new(-1);
+static RELOAD: AtomicBool = AtomicBool::new(false);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 static PLAYBACK: OnceLock<thread::Thread> = OnceLock::new();
 
@@ -94,6 +95,14 @@ pub fn set_own_window(h: usize) {
 pub fn load(actions: Vec<Action>) {
     stop();
     *ACTIONS.lock().unwrap() = Some(Arc::new(actions));
+}
+
+/// Swap in a rescheduled timeline of the same song, keeping position and
+/// state (the next seek picks it up).
+pub fn replace(actions: Vec<Action>) {
+    *ACTIONS.lock().unwrap() = Some(Arc::new(actions));
+    RELOAD.store(true, SeqCst);
+    seek(position_us());
 }
 
 pub fn has_song() -> bool {
@@ -269,7 +278,7 @@ fn playback() {
         let sk = SEEK_US.swap(-1, SeqCst);
         if sk >= 0 {
             release_all(&mut physical);
-            if fresh {
+            if RELOAD.swap(false, SeqCst) || fresh {
                 if let Some(a) = ACTIONS.lock().unwrap().clone() {
                     acts = a;
                     fresh = false;

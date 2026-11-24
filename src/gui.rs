@@ -66,6 +66,8 @@ struct Hold {
 
 struct Done {
     gen: u64,
+    /// keep the player's position and state (pedal changed while paused)
+    keep: bool,
     result: Result<analyze::Analysis, String>,
 }
 
@@ -109,20 +111,27 @@ fn invalidate(hwnd: HWND) {
 
 /// Start (re)analysis of the current file on a worker thread.
 fn analyze_async(app: &mut App) {
+    analyze_with(app, false);
+}
+
+/// `keep`: swap the new timeline in at the same position instead of stopping.
+fn analyze_with(app: &mut App, keep: bool) {
     let Some(path) = app.file.clone() else { return };
     app.gen += 1;
     let gen = app.gen;
     app.model.analyzing = true;
     app.model.error = None;
     app.dirty = true;
-    player::stop();
+    if !keep {
+        player::stop();
+    }
     let st = app.model.settings();
     let hwnd = app.hwnd as usize;
     std::thread::spawn(move || {
         let result = std::fs::read(&path)
             .map_err(|e| format!("파일을 열 수 없습니다: {e}"))
             .and_then(|b| analyze::analyze(&b, &st));
-        *DONE.lock().unwrap() = Some(Done { gen, result });
+        *DONE.lock().unwrap() = Some(Done { gen, keep, result });
         unsafe {
             PostMessageW(hwnd as HWND, WM_ANALYZED, 0, 0);
         }
@@ -330,7 +339,7 @@ fn click(hwnd: HWND, wid: Wid) {
         w => {
             with_app(|a| {
                 if a.model.click_setting(w) {
-                    analyze_async(a);
+                    analyze_with(a, w == Wid::Pedal && !a.model.editable());
                 }
                 player::set_any_window(!a.model.roblox_only);
                 a.dirty = true;
@@ -598,12 +607,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     match done.result {
                         Ok(an) => {
                             a.model.summary = Some(an.summary.clone());
-                            if an.ok {
+                            // stopped meanwhile (F7): load as usual, from the start
+                            let keep = done.keep && !matches!(player::state(), player::ST_STOPPED | player::ST_DONE);
+                            if an.ok && keep {
+                                player::replace(an.schedule.actions);
+                            } else if an.ok {
                                 player::load(an.schedule.actions);
+                            } else if keep {
+                                player::stop();
                             }
                             a.model.set_vis(an.schedule.vis);
                         }
                         Err(e) => {
+                            if done.keep {
+                                player::stop();
+                            }
                             a.model.error = Some(e);
                             a.model.summary = None;
                         }

@@ -202,13 +202,23 @@ impl Model {
     pub fn editable(&self) -> bool {
         matches!(self.state, ST_STOPPED | ST_DONE) && !self.analyzing
     }
+    /// Pedal changes no note times, so a paused song can be rescheduled
+    /// and resumed from the same spot.
+    pub fn pedal_editable(&self) -> bool {
+        matches!(self.state, ST_STOPPED | ST_DONE | ST_PAUSED | ST_LOST) && !self.analyzing
+    }
     pub fn set_vis(&mut self, v: Vec<VisNote>) {
         self.vis_maxdur = v.iter().map(|n| n.end - n.start).max().unwrap_or(0);
         self.vis = Arc::new(v);
     }
     /// Apply a click. Returns true if analysis settings changed.
     pub fn click_setting(&mut self, w: Wid) -> bool {
-        if !self.editable() && !matches!(w, Wid::Vis | Wid::Roblox) {
+        let ok = match w {
+            Wid::Vis | Wid::Roblox => true,
+            Wid::Pedal => self.pedal_editable(),
+            _ => self.editable(),
+        };
+        if !ok {
             return false;
         }
         match w {
@@ -1338,7 +1348,7 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
     // divider + toggles
     cv.rect(c.x + 20.0, TOG0 - 6.0, c.w - 40.0, 1.0, col(BORDER, 1.0));
     let toggles = [
-        ("서스테인 페달 → Space", m.pedal, Wid::Pedal, ed),
+        ("서스테인 페달 → Space", m.pedal, Wid::Pedal, m.pedal_editable()),
         ("Roblox 창에만 입력", m.roblox_only, Wid::Roblox, true),
         ("비주얼라이저", m.vis_on, Wid::Vis, true),
     ];
@@ -1422,6 +1432,23 @@ mod tests {
         m.set_vis(vec![VisNote { start: 0, end: 180_000_000, pitch: 60, kept: true }]);
         m.summary = Some(Summary { length_us: 180_000_000, ok: true, ..Summary::default() });
         m
+    }
+
+    #[test]
+    fn pedal_can_change_while_paused_but_not_while_playing() {
+        for st in [ST_PAUSED, ST_LOST] {
+            let mut m = Model { state: st, ..Model::default() };
+            assert!(m.click_setting(Wid::Pedal), "state {st}");
+            assert!(!m.pedal);
+            // settings that move the song's time axis stay locked
+            assert!(!m.click_setting(Wid::SpeedUp));
+            assert_eq!(m.speed, 1.0);
+        }
+        let mut m = playing(false);
+        assert!(!m.click_setting(Wid::Pedal));
+        assert!(m.pedal);
+        let mut m = Model { state: ST_PAUSED, analyzing: true, ..Model::default() };
+        assert!(!m.click_setting(Wid::Pedal));
     }
 
     #[test]
