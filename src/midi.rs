@@ -158,7 +158,7 @@ pub fn parse(bytes: &[u8], opt: &Options) -> Result<Parsed, String> {
     Ok(Parsed { events, tempo_changes, notes, folded, pedal_changes, length_us, bpm })
 }
 
-fn class(k: Kind) -> u8 {
+pub fn class(k: Kind) -> u8 {
     match k {
         Kind::NoteOff(_) => 0,
         Kind::Pedal(_) => 1,

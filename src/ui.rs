@@ -17,7 +17,6 @@ use tiny_skia::{
 
 pub const W: f32 = 1120.0;
 pub const H: f32 = 700.0;
-pub const FPS_CHOICES: [f64; 5] = [60.0, 120.0, 144.0, 165.0, 240.0];
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
 // player states (same numbers as player.rs)
@@ -66,7 +65,6 @@ pub enum Wid {
     Play,
     Stop,
     Seek,
-    Fps(u8),
     SpeedDn,
     SpeedUp,
     TransDn,
@@ -75,6 +73,10 @@ pub enum Wid {
     TolUp,
     RateDn,
     RateUp,
+    WinDn,
+    WinUp,
+    HumanDn,
+    HumanUp,
     Pedal,
     Drums,
     Roblox,
@@ -82,12 +84,15 @@ pub enum Wid {
 }
 
 pub struct Model {
-    pub fps_idx: usize,
     pub speed: f64,
     pub transpose: i32,
-    /// None = automatic (follows FPS)
+    /// None = automatic
     pub tol_ms: Option<i32>,
+    /// strikes allowed per `rate_win_ms` (0 = unlimited)
     pub rate: i32,
+    pub rate_win_ms: i32,
+    /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
+    pub human: u8,
     pub pedal: bool,
     pub drums: bool,
     pub roblox_only: bool,
@@ -108,11 +113,12 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Model {
-            fps_idx: 0,
             speed: 1.0,
             transpose: 0,
             tol_ms: None,
-            rate: 200,
+            rate: 20,
+            rate_win_ms: 100,
+            human: 0,
             pedal: true,
             drums: false,
             roblox_only: true,
@@ -135,18 +141,19 @@ impl Default for Model {
 impl Model {
     pub fn settings(&self) -> Settings {
         Settings {
-            fps: FPS_CHOICES[self.fps_idx],
             speed: self.speed,
             transpose: self.transpose,
             pedal: self.pedal,
             drums: self.drums,
             tolerance: self.tol_ms.map(|t| t as f64),
-            max_rate: Some(self.rate as f64),
+            rate_count: Some(self.rate as usize),
+            rate_window: Some(self.rate_win_ms as f64),
+            human: self.human,
             ..Settings::default()
         }
     }
     pub fn auto_tol_ms(&self) -> i32 {
-        let p = crate::schedule::Params::from_fps(FPS_CHOICES[self.fps_idx]);
+        let p = crate::schedule::Params::default();
         (p.tolerance as f64 / 1000.0).round() as i32
     }
     pub fn editable(&self) -> bool {
@@ -162,7 +169,6 @@ impl Model {
             return false;
         }
         match w {
-            Wid::Fps(i) => self.fps_idx = i as usize,
             // single-tempo songs step by whole BPM, others by 0.05x
             Wid::SpeedDn | Wid::SpeedUp => {
                 let d = if w == Wid::SpeedUp { 1.0 } else { -1.0 };
@@ -186,8 +192,12 @@ impl Model {
                     Some(t) => Some(t + 5),
                 }
             }
-            Wid::RateDn => self.rate -= 25,
-            Wid::RateUp => self.rate += 25,
+            Wid::RateDn => self.rate -= 1,
+            Wid::RateUp => self.rate += 1,
+            Wid::WinDn => self.rate_win_ms -= 10,
+            Wid::WinUp => self.rate_win_ms += 10,
+            Wid::HumanDn => self.human = self.human.saturating_sub(1),
+            Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
@@ -203,7 +213,8 @@ impl Model {
         self.speed = self.speed.clamp(0.25, 3.0);
         self.transpose = self.transpose.clamp(-24, 24);
         self.tol_ms = self.tol_ms.map(|t| t.clamp(0, 150));
-        self.rate = self.rate.clamp(0, 1000);
+        self.rate = self.rate.clamp(0, 200);
+        self.rate_win_ms = self.rate_win_ms.clamp(10, 1000);
         true
     }
     /// A different song was opened: speed/tempo is kept per song only.
@@ -259,12 +270,13 @@ const M: f32 = 20.0;
 const RIGHT_W: f32 = 340.0;
 const VIS_CARD: R = R::new(M, 72.0, W - M * 3.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(M, H - M - 84.0, W - M * 3.0 - RIGHT_W, 84.0);
-const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 412.0);
-const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 412.0 + 12.0, RIGHT_W, H - M - (72.0 + 412.0 + 12.0));
+const SET_H: f32 = 454.0;
+const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
+const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const ROW0: f32 = SET_CARD.y + 56.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 5.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -281,11 +293,6 @@ fn stepper_rects(row: usize) -> (R, R) {
     let right = SET_CARD.x + SET_CARD.w - 18.0;
     (R::new(right - 124.0, y, 30.0, 30.0), R::new(right - 30.0, y, 30.0, 30.0))
 }
-fn seg_rect(i: usize) -> R {
-    let right = SET_CARD.x + SET_CARD.w - 18.0;
-    let w = 40.0;
-    R::new(right - w * FPS_CHOICES.len() as f32 + w * i as f32, ROW0 + 7.0, w, 28.0)
-}
 fn toggle_row(i: usize) -> R {
     R::new(SET_CARD.x + 8.0, TOG0 + i as f32 * TOG_H, SET_CARD.w - 16.0, TOG_H)
 }
@@ -299,12 +306,16 @@ pub fn widgets() -> Vec<(R, Wid)> {
     v.push((R::new(sx - sr, sy - sr, sr * 2.0, sr * 2.0), Wid::Stop));
     let sb = seek_bar();
     v.push((R::new(sb.x - 6.0, sb.y - 10.0, sb.w + 12.0, sb.h + 20.0), Wid::Seek));
-    for i in 0..FPS_CHOICES.len() {
-        v.push((seg_rect(i), Wid::Fps(i as u8)));
-    }
-    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp)];
+    let pairs = [
+        (Wid::SpeedDn, Wid::SpeedUp),
+        (Wid::TransDn, Wid::TransUp),
+        (Wid::TolDn, Wid::TolUp),
+        (Wid::RateDn, Wid::RateUp),
+        (Wid::WinDn, Wid::WinUp),
+        (Wid::HumanDn, Wid::HumanUp),
+    ];
     for (i, (dn, up)) in pairs.iter().enumerate() {
-        let (a, b) = stepper_rects(i + 1);
+        let (a, b) = stepper_rects(i);
         v.push((a, *dn));
         v.push((b, *up));
     }
@@ -601,7 +612,7 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (m.fps_idx, m.speed.to_bits(), m.transpose, m.tol_ms, m.rate).hash(&mut h);
+    (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
     if let Some(su) = &m.summary {
@@ -915,29 +926,11 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         }
     };
 
-    // FPS segmented
-    label(cv, 0, "Roblox FPS", "");
-    let r0 = seg_rect(0);
-    let n = FPS_CHOICES.len();
-    cv.rr(r0.x - 3.0, r0.y - 3.0, r0.w * n as f32 + 6.0, r0.h + 6.0, 10.0, col(0x0E121B, 1.0));
-    for i in 0..n {
-        let r = seg_rect(i);
-        let sel = m.fps_idx == i;
-        if sel {
-            let p = hgrad(r.x, r.x + r.w, col(ACCENT, la), col(0x9A6BFF, la));
-            cv.rr_paint(r.x, r.y, r.w, r.h, 8.0, &p);
-        } else if m.hover == Some(Wid::Fps(i as u8)) && ed {
-            cv.rr(r.x, r.y, r.w, r.h, 8.0, col(0x222A3B, 1.0));
-        }
-        let t = format!("{}", FPS_CHOICES[i] as u32);
-        cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(if sel { 0xFFFFFF } else { SUB }, la), &t);
-    }
-
     let (speed_label, speed_sub) = match m.base_bpm() {
         Some(b) => ("템포", format!("원곡 {} BPM", bpm_text(b))),
         None => ("재생 속도", String::new()),
     };
-    let rows: [(&str, &str, String, Wid, Wid); 4] = [
+    let rows: [(&str, &str, String, Wid, Wid); 6] = [
         (speed_label, &speed_sub, m.speed_text(), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
@@ -951,16 +944,30 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             Wid::TolUp,
         ),
         (
-            "초당 최대 타건",
+            "최대 타건",
             "Roblox 렉 방지 · 0 = 무제한",
-            if m.rate == 0 { "무제한".into() } else { format!("{}", m.rate) },
+            if m.rate == 0 { "무제한".into() } else { format!("{}회", m.rate) },
             Wid::RateDn,
             Wid::RateUp,
         ),
+        (
+            "제한 구간",
+            "이 시간 안에 최대 타건까지",
+            format!("{} ms", m.rate_win_ms),
+            Wid::WinDn,
+            Wid::WinUp,
+        ),
+        (
+            "사람처럼 연주",
+            "타이밍 오차 · 화음 엇갈림",
+            crate::humanize::LEVEL_NAMES[m.human as usize].into(),
+            Wid::HumanDn,
+            Wid::HumanUp,
+        ),
     ];
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {
-        label(cv, i + 1, t, sub);
-        let (a, b) = stepper_rects(i + 1);
+        label(cv, i, t, sub);
+        let (a, b) = stepper_rects(i);
         for (r, w, minus) in [(a, *dn, true), (b, *up, false)] {
             let hov = m.hover == Some(w) && ed;
             cv.rr(r.x, r.y, r.w, r.h, 9.0, col(if hov { 0x283044 } else { CARD2 }, 1.0));
@@ -1022,12 +1029,12 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 
     let total = (s.kept + s.dropped).max(1);
     let pct = 100.0 * s.kept as f64 / total as f64;
-    let y = c.y + 50.0;
+    let y = c.y + 44.0;
     let w = cv.text(c.x + 20.0, y, 30.0, true, col(TEXT, 1.0), &format!("{pct:.1}"));
     cv.text(c.x + 20.0 + w + 2.0, y + 13.0, 15.0, true, col(SUB, 1.0), "%");
     cv.text(c.x + 20.0 + w + 26.0, y + 15.0, 12.0, false, col(SUB, 1.0), "원래 자리에서 연주되는 음");
     // ratio bar
-    let by = y + 46.0;
+    let by = y + 42.0;
     let bwid = c.w - 40.0;
     cv.rr(c.x + 20.0, by, bwid, 6.0, 3.0, col(0x252D3F, 1.0));
     let p = hgrad(c.x + 20.0, c.x + 20.0 + bwid, col(ACCENT, 1.0), col(ACCENT2, 1.0));
@@ -1042,8 +1049,8 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
     let cw = (c.w - 40.0) / 4.0;
     for (i, (k, v)) in cells.iter().enumerate() {
         let x = c.x + 20.0 + i as f32 * cw;
-        cv.text(x, by + 20.0, 11.0, false, col(DIM, 1.0), k);
-        cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
+        cv.text(x, by + 16.0, 11.0, false, col(DIM, 1.0), k);
+        cv.text(x, by + 32.0, 14.5, true, col(TEXT, 1.0), v);
     }
 }
 
