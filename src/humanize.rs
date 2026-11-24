@@ -10,7 +10,9 @@
 //!   `lead/2..lead` (pianists' melody lead is about 20-30 ms; Goebl 2001, JASA).
 //!   The followers are grouped by Shift/Ctrl state, so a chord never needs more
 //!   modifier switches than it would unhumanized.
-//! - Note lengths are kept; pedal events are not moved.
+//! - Note lengths are kept, except that a note which ended by the next moment
+//!   still ends by that moment's new start (released before its Shift/Ctrl
+//!   switch); pedal events are not moved.
 //! - The random sequence is fixed, so the same file and settings always give the
 //!   same performance (and the visualizer shows exactly what is played).
 
@@ -84,6 +86,8 @@ pub fn apply(events: &[Ev], h: Human) -> Vec<Ev> {
         Kind::NoteOn(p) => p,
         _ => unreachable!(),
     };
+    // each moment's original time and new start (its first, melody note)
+    let mut starts: Vec<(i64, i64)> = Vec::with_capacity(chords.len());
     for (c, &(a, b)) in chords.iter().enumerate() {
         let t = events[ons[a]].t;
         let prev = if c > 0 { t - events[ons[chords[c - 1].0]].t } else { i64::MAX };
@@ -92,6 +96,7 @@ pub fn apply(events: &[Ev], h: Human) -> Vec<Ev> {
         // chord spread <= 2/5 of the gap after it (1/4 + 2/5 + 1/4 < 1)
         let cap = ((h.jitter * 5 / 2) as f64).min(prev.min(next) as f64 / 4.0);
         let j = (rng.normal() * h.jitter as f64).clamp(-cap, cap).round() as i64;
+        starts.push((t, (t + j).max(0)));
 
         let mut idx: Vec<usize> = ons[a..b].to_vec();
         let mut offs = vec![0i64; idx.len()];
@@ -124,19 +129,27 @@ pub fn apply(events: &[Ev], h: Human) -> Vec<Ev> {
         }
     }
 
-    // move each note-off with its note-on (FIFO per pitch, like the scheduler)
-    let mut open: Vec<std::collections::VecDeque<i64>> = vec![Default::default(); 128];
+    // move each note-off with its note-on (FIFO per pitch, like the scheduler),
+    // but never past the new start of the moment it originally ended before or
+    // at: a legato note must still be released before the next moment's
+    // Shift/Ctrl switch, or the key comes up under the other modifier state
+    let mut open: Vec<std::collections::VecDeque<(i64, i64)>> = vec![Default::default(); 128];
     let mut out: Vec<Ev> = Vec::with_capacity(events.len());
     for (i, e) in events.iter().enumerate() {
         match e.kind {
             Kind::NoteOn(p) => {
                 let t = (e.t + shift[i]).max(0);
-                open[p as usize].push_back(t - e.t);
+                open[p as usize].push_back((t, t - e.t));
                 out.push(Ev { t, kind: e.kind });
             }
             Kind::NoteOff(p) => {
-                let d = open[p as usize].pop_front().unwrap_or(0);
-                out.push(Ev { t: (e.t + d).max(0), kind: e.kind });
+                let (on_t, d) = open[p as usize].pop_front().unwrap_or((0, 0));
+                let mut t = (e.t + d).max(0);
+                let k = starts.partition_point(|s| s.0 < e.t);
+                if let Some(&(_, next_start)) = starts.get(k) {
+                    t = t.min(next_start).max(on_t);
+                }
+                out.push(Ev { t, kind: e.kind });
             }
             Kind::Pedal(_) => out.push(*e),
         }
@@ -202,9 +215,11 @@ mod tests {
         assert_eq!(hv.len(), ev.len());
         let (a, b) = (notes(&ev), notes(&hv));
         let mut moved = 0;
-        for (x, y) in a.iter().zip(&b) {
+        for (k, (x, y)) in a.iter().zip(&b).enumerate() {
             assert_eq!(x.0, y.0, "order of notes changed");
-            assert_eq!(x.2 - x.1, y.2 - y.1, "length changed");
+            // same length, unless that would run past the next note's new start
+            let next = b.get(k + 1).map(|n| n.1).unwrap_or(i64::MAX);
+            assert!(y.2 - y.1 == x.2 - x.1 || (y.2 - y.1 < x.2 - x.1 && y.2 == next), "length changed");
             assert!((y.1 - x.1).abs() <= max_shift(H));
             moved += (y.1 != x.1) as usize;
         }
@@ -242,6 +257,48 @@ mod tests {
         let p = schedule::Params::default();
         let s = schedule::build(&apply(&ev, H), p);
         assert_eq!((s.strikes, s.merged), (3, 1));
+    }
+
+    /// Share of note keys released under a different Shift/Ctrl state than they
+    /// were pressed under (a Roblox piano may read the state again on release).
+    fn release_mismatch(ev: &[Ev]) -> usize {
+        use crate::layout::{SC_LCTRL, SC_LSHIFT};
+        let s = schedule::build(ev, schedule::Params::default());
+        let (mut shift, mut ctrl) = (false, false);
+        let mut at_down = [(false, false); 256];
+        let mut bad = 0;
+        for a in &s.actions {
+            match a.act {
+                schedule::Act::Down(sc) if sc == SC_LSHIFT => shift = true,
+                schedule::Act::Up(sc) if sc == SC_LSHIFT => shift = false,
+                schedule::Act::Down(sc) if sc == SC_LCTRL => ctrl = true,
+                schedule::Act::Up(sc) if sc == SC_LCTRL => ctrl = false,
+                schedule::Act::Down(sc) => at_down[sc as usize] = (shift, ctrl),
+                schedule::Act::Up(sc) => bad += (at_down[sc as usize] != (shift, ctrl)) as usize,
+            }
+        }
+        bad
+    }
+
+    /// In a quantized legato line each note ends exactly where the next begins, so
+    /// unhumanized it is released before the next note's Shift/Ctrl switch. Humanize
+    /// must keep that: the old note may not end after the next moment has started.
+    #[test]
+    fn legato_releases_before_the_next_switch() {
+        let mut v = vec![];
+        let line = [60u8, 61, 62, 63, 64, 66, 67, 68, 69, 70, 71, 72];
+        for i in 0..400i64 {
+            let (t, p) = (i * 125_000, line[(i % 12) as usize]);
+            v.push(on(t, p));
+            v.push(off(t + 125_000, p));
+            if i % 2 == 0 { v.push(on(t, 48 + (i % 3) as u8)); v.push(off(t + 250_000, 48 + (i % 3) as u8)); }
+        }
+        let ev = sorted(v);
+        let base = release_mismatch(&ev);
+        for lv in 1..=3 {
+            let hv = release_mismatch(&apply(&ev, level(lv).unwrap()));
+            assert!(hv <= base, "level {lv}: {hv} releases under another modifier (unhumanized {base})");
+        }
     }
 
     #[test]
