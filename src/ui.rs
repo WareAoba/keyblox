@@ -17,7 +17,7 @@ use tiny_skia::{
 };
 
 pub const W: f32 = 1120.0 + SIDE_W + M;
-pub const H: f32 = 742.0;
+pub const H: f32 = 784.0;
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
 // player states (same numbers as player.rs)
@@ -27,6 +27,7 @@ pub const ST_PLAYING: u8 = 2;
 pub const ST_PAUSED: u8 = 3;
 pub const ST_LOST: u8 = 4;
 pub const ST_DONE: u8 = 5;
+pub const ST_COUNT: u8 = 6;
 
 // ---------------------------------------------------------------- colors
 /// Pixel buffers on Windows are BGRA, so red/blue are swapped at the source.
@@ -78,6 +79,8 @@ pub enum Wid {
     WinUp,
     HumanDn,
     HumanUp,
+    CountDn,
+    CountUp,
     /// Roblox frame-rate choice (index into FPS_CHOICES)
     Fps(u8),
     /// BPM / multiplier switch of the speed row
@@ -120,6 +123,8 @@ pub struct Model {
     pub rate_win_ms: i32,
     /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
     pub human: u8,
+    /// seconds to wait before playback starts (0 = off)
+    pub countdown: i32,
     pub pedal: bool,
     pub roblox_only: bool,
     pub vis_on: bool,
@@ -131,6 +136,8 @@ pub struct Model {
     pub vis_maxdur: i64,
     pub state: u8,
     pub pos_us: i64,
+    /// time left in the countdown (state ST_COUNT)
+    pub count_left_us: i64,
     pub blocked: bool,
     pub hover: Option<Wid>,
     pub pressed: Option<Wid>,
@@ -155,6 +162,7 @@ impl Default for Model {
             rate: 20,
             rate_win_ms: 100,
             human: 0,
+            countdown: 3,
             pedal: true,
             roblox_only: true,
             vis_on: true,
@@ -166,6 +174,7 @@ impl Default for Model {
             vis_maxdur: 0,
             state: ST_STOPPED,
             pos_us: 0,
+            count_left_us: 0,
             blocked: false,
             hover: None,
             pressed: None,
@@ -241,6 +250,10 @@ impl Model {
             Wid::WinUp => self.rate_win_ms += 10,
             Wid::HumanDn => self.human = self.human.saturating_sub(1),
             Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
+            Wid::CountDn | Wid::CountUp => {
+                self.countdown = (self.countdown + if w == Wid::CountUp { 1 } else { -1 }).clamp(0, 10);
+                return false; // playback only, not analysis
+            }
             Wid::SpeedUnit => {
                 self.speed_bpm = !self.speed_bpm;
                 return false; // same speed, shown another way
@@ -281,7 +294,8 @@ impl Model {
             2 => self.tol_ms.map(|t| t.to_string()).unwrap_or_default(),
             3 => self.rate.to_string(),
             4 => self.rate_win_ms.to_string(),
-            _ => self.human.to_string(),
+            5 => self.human.to_string(),
+            _ => self.countdown.to_string(),
         };
         self.edit = Some(Edit { row, text, fresh: true });
     }
@@ -339,6 +353,7 @@ impl Model {
                 2 => self.tol_ms = Some(n),
                 3 => self.rate = n,
                 4 => self.rate_win_ms = n,
+                6 => self.countdown = n.clamp(0, 10),
                 _ => self.human = n.clamp(0, crate::humanize::LEVEL_NAMES.len() as i32 - 1) as u8,
             }
             self.clamp_settings();
@@ -431,7 +446,7 @@ const LIST: R = R::new(SIDE_CARD.x + 8.0, SIDE_CARD.y + 94.0, SIDE_W - 16.0, SID
 const LIST_ROW_H: f32 = 30.0;
 const VIS_CARD: R = R::new(X0, 72.0, W - X0 - M * 2.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(X0, H - M - 84.0, W - X0 - M * 2.0 - RIGHT_W, 84.0);
-const SET_H: f32 = 462.0;
+const SET_H: f32 = 504.0;
 const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
 const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
@@ -439,7 +454,7 @@ const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const FPS_ROW: f32 = SET_CARD.y + 56.0;
 const ROW0: f32 = FPS_ROW + 42.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 7.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -511,6 +526,7 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
         (Wid::RateDn, Wid::RateUp),
         (Wid::WinDn, Wid::WinUp),
         (Wid::HumanDn, Wid::HumanUp),
+        (Wid::CountDn, Wid::CountUp),
     ];
     for (i, (dn, up)) in pairs.iter().enumerate() {
         let (a, b) = stepper_rects(i);
@@ -533,7 +549,7 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
 /// The -/+ buttons of the settings rows.
 pub fn is_stepper(w: Wid) -> bool {
     use Wid::*;
-    matches!(w, SpeedDn | SpeedUp | TransDn | TransUp | TolDn | TolUp | RateDn | RateUp | WinDn | WinUp | HumanDn | HumanUp)
+    matches!(w, SpeedDn | SpeedUp | TransDn | TransUp | TolDn | TolUp | RateDn | RateUp | WinDn | WinUp | HumanDn | HumanUp | CountDn | CountUp)
 }
 
 pub fn in_song_list(x: f32, y: f32) -> bool {
@@ -573,7 +589,13 @@ pub fn frame_key(m: &Model, scale: f32) -> i64 {
         let bar = (seek_bar().w * progress(m) * scale * 4.0).round() as i64;
         (m.pos_us.max(0) / 1_000_000) << 24 | bar
     };
-    shown << 1 | m.blocked as i64
+    let count = if m.state == ST_COUNT { count_digit(m) } else { 0 };
+    (shown << 1 | m.blocked as i64) << 4 | count
+}
+
+/// Whole seconds shown while counting down (3, 2, 1).
+fn count_digit(m: &Model) -> i64 {
+    (m.count_left_us.max(0) + 999_999) / 1_000_000
 }
 
 // ---------------------------------------------------------------- canvas
@@ -1148,6 +1170,12 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
         cv.rr(area.cx() - 70.0, area.y + 16.0, 140.0, 30.0, 15.0, col(CARD2, 0.95));
         cv.text_c(area.cx(), area.y + 31.0, 13.0, false, col(TEXT, 1.0), "다시 분석 중…");
     }
+    if m.state == ST_COUNT {
+        cv.rect(area.x, area.y, area.w, area.h, col(BG, 0.6));
+        cv.circle(area.cx(), area.cy() - 10.0, 64.0, &solid(col(CARD2, 0.95)));
+        cv.text_c(area.cx(), area.cy() - 8.0, 64.0, true, col(TEXT, 1.0), &count_digit(m).to_string());
+        cv.text_c(area.cx(), area.cy() + 82.0, 13.5, false, col(SUB, 1.0), "곧 시작합니다 · F6 취소");
+    }
 }
 
 fn transport(cv: &mut Canvas, m: &Model) {
@@ -1162,7 +1190,7 @@ fn transport(cv: &mut Canvas, m: &Model) {
     }
     cv.circle(px, py, pr, &p);
     let white = col(0xFFFFFF, if can { 1.0 } else { 0.6 });
-    if matches!(m.state, ST_PLAYING | ST_ARMED) {
+    if matches!(m.state, ST_PLAYING | ST_ARMED | ST_COUNT) {
         cv.rr(px - 7.5, py - 9.0, 5.5, 18.0, 1.5, white);
         cv.rr(px + 2.0, py - 9.0, 5.5, 18.0, 1.5, white);
     } else {
@@ -1194,7 +1222,9 @@ fn transport(cv: &mut Canvas, m: &Model) {
         ("입력 차단됨 · 관리자 권한으로 실행해 보세요".to_string(), RED)
     } else {
         match m.state {
+            ST_ARMED if m.countdown > 0 => (format!("Roblox 창을 클릭하면 {}초 뒤 시작합니다", m.countdown), AMBER),
             ST_ARMED => ("Roblox 창을 클릭하면 시작합니다".into(), AMBER),
+            ST_COUNT => (format!("{}초 뒤 시작", count_digit(m)), AMBER),
             ST_PLAYING => ("재생 중".into(), GREEN),
             ST_PAUSED => ("일시정지".into(), SUB),
             ST_LOST => ("Roblox 창이 앞에 없어 일시정지".into(), AMBER),
@@ -1250,7 +1280,7 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         Some(b) => ("템포", format!("원곡 {} BPM", bpm_text(b))),
         None => ("재생 속도", String::new()),
     };
-    let rows: [(&str, &str, String, Wid, Wid); 6] = [
+    let rows: [(&str, &str, String, Wid, Wid); 7] = [
         (speed_label, &speed_sub, m.speed_text(), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
@@ -1283,6 +1313,13 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             crate::humanize::LEVEL_NAMES[m.human as usize].into(),
             Wid::HumanDn,
             Wid::HumanUp,
+        ),
+        (
+            "카운트다운",
+            "재생 전 대기 · 0 = 끔",
+            if m.countdown == 0 { "끔".into() } else { format!("{}초", m.countdown) },
+            Wid::CountDn,
+            Wid::CountUp,
         ),
     ];
     if m.base_bpm().is_some() {
@@ -1445,6 +1482,31 @@ mod tests {
     fn frame_key_shows_blocked_warning() {
         let m = playing(false);
         assert_ne!(frame_key(&m, 1.0), frame_key(&Model { blocked: true, ..playing(false) }, 1.0));
+    }
+
+    #[test]
+    fn frame_key_follows_countdown_seconds() {
+        let at = |left: i64| frame_key(&Model { state: ST_COUNT, count_left_us: left, ..playing(false) }, 1.0);
+        assert_eq!(at(2_400_000), at(2_100_000));
+        assert_ne!(at(2_001_000), at(2_000_000)); // 3 -> 2
+    }
+
+    #[test]
+    fn countdown_is_a_playback_setting_not_an_analysis_one() {
+        let mut m = Model::default();
+        assert_eq!(m.countdown, 3);
+        // never triggers re-analysis
+        assert!(!m.click_setting(Wid::CountUp));
+        assert_eq!(m.countdown, 4);
+        for _ in 0..20 {
+            m.click_setting(Wid::CountDn);
+        }
+        assert_eq!(m.countdown, 0);
+        m.begin_edit(6);
+        m.edit_char('9');
+        m.edit_char('9');
+        assert!(!m.commit_edit());
+        assert_eq!(m.countdown, 10);
     }
 
     #[test]

@@ -374,6 +374,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 m.state = player::state();
                 m.pos_us = player::position_us().min(m.length_us().max(0));
                 m.blocked = player::input_blocked();
+                m.count_left_us = player::countdown_left_us();
+                player::set_countdown(m.countdown); // one place for every way the value changes
                 if m.edit.is_some() && !m.editable() {
                     m.cancel_edit(); // playback started (F6) while typing
                     a.dirty = true;
