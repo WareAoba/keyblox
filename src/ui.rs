@@ -612,7 +612,7 @@ pub fn render_badge(cv: &mut Canvas, digit: i64) -> Pixmap {
     let c = BADGE / 2.0;
     cv.circle(c, c, c - 1.0, &hgrad(0.0, BADGE, col(ACCENT, 0.95), col(0x9A6BFF, 0.95)));
     cv.circle(c, c, c - 5.0, &solid(col(CARD2, 0.92)));
-    cv.text_c(c, c + 2.0, 64.0, true, col(TEXT, 1.0), &digit.to_string());
+    cv.text_ink_c(c, c, 64.0, true, col(TEXT, 1.0), &digit.to_string());
     std::mem::swap(&mut cv.pm, &mut pm);
     pm
 }
@@ -837,6 +837,29 @@ impl Canvas {
     fn text_c(&mut self, cx: f32, cy: f32, size: f32, bold: bool, c: Color, txt: &str) {
         let w = self.measure(size, bold, txt);
         self.text(cx - w / 2.0, cy - size * 0.68, size, bold, c, txt);
+    }
+    /// Center the glyphs' ink (not the line box) on (cx, cy): for big digits.
+    fn text_ink_c(&mut self, cx: f32, cy: f32, size: f32, bold: bool, c: Color, txt: &str) {
+        let px = size * self.s;
+        let f = if bold { &self.fonts.bold } else { &self.fonts.regular };
+        let asc = f.horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px * 0.9);
+        // ink box in device px, relative to the pen start and the line top
+        let (mut l, mut r, mut t, mut b) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        let mut pen = 0.0;
+        for ch in txt.chars() {
+            let m = self.glyph(bold, ch, px).0;
+            l = l.min(pen + m.xmin as f32);
+            r = r.max(pen + m.xmin as f32 + m.width as f32);
+            t = t.min(asc - (m.height as f32 + m.ymin as f32));
+            b = b.max(asc - m.ymin as f32);
+            pen += m.advance_width;
+        }
+        if l > r {
+            return;
+        }
+        let x = (cx * self.s - (l + r) / 2.0).round() / self.s;
+        let y = (cy * self.s - (t + b) / 2.0).round() / self.s;
+        self.text(x, y, size, bold, c, txt);
     }
     fn text_r(&mut self, right: f32, y: f32, size: f32, bold: bool, c: Color, txt: &str) {
         let w = self.measure(size, bold, txt);
@@ -1192,7 +1215,7 @@ fn visualizer_dynamic(cv: &mut Canvas, m: &Model) {
     if m.state == ST_COUNT {
         cv.rect(area.x, area.y, area.w, area.h, col(BG, 0.6));
         cv.circle(area.cx(), area.cy() - 10.0, 64.0, &solid(col(CARD2, 0.95)));
-        cv.text_c(area.cx(), area.cy() - 8.0, 64.0, true, col(TEXT, 1.0), &count_digit(m).to_string());
+        cv.text_ink_c(area.cx(), area.cy() - 10.0, 64.0, true, col(TEXT, 1.0), &count_digit(m).to_string());
         cv.text_c(area.cx(), area.cy() + 82.0, 13.5, false, col(SUB, 1.0), "곧 시작합니다 · F6 취소");
     }
 }
@@ -1523,6 +1546,31 @@ mod tests {
         assert!(alpha(side / 2, 8) > 200);
         assert_ne!(render_badge(&mut cv, 3).data(), render_badge(&mut cv, 2).data());
         assert_eq!(cv.pm.width(), (W as u32)); // the window canvas is left alone
+    }
+
+    #[test]
+    fn countdown_digit_sits_in_the_middle_of_the_badge() {
+        let reg = std::fs::read("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc");
+        let bold = std::fs::read("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc");
+        let (Ok(reg), Ok(bold)) = (reg, bold) else { return }; // fonts not installed
+        for scale in [1.0, 1.5, 2.0] {
+            let mut cv = Canvas::new(scale, Fonts::load(&reg, 1, &bold, 1).unwrap());
+            for d in 1..=10 {
+                let pm = render_badge(&mut cv, d);
+                let side = pm.width() as i32;
+                // ink of the digit: the bright text pixels
+                let (mut x0, mut y0, mut x1, mut y1) = (side, side, 0, 0);
+                for y in 0..side {
+                    for x in 0..side {
+                        if pm.data()[((y * side + x) * 4) as usize] > 0xC0 {
+                            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                        }
+                    }
+                }
+                let off = |a: i32, b: i32| ((a + b + 1) as f32 / 2.0 - side as f32 / 2.0).abs();
+                assert!(off(x0, x1) <= 1.0 && off(y0, y1) <= 1.0, "digit {d} at x{scale}: ink {x0},{y0}..{x1},{y1} in {side}");
+            }
+        }
     }
 
     #[test]
