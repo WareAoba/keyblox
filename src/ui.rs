@@ -75,6 +75,8 @@ pub enum Wid {
     RateUp,
     WinDn,
     WinUp,
+    HumanDn,
+    HumanUp,
     Pedal,
     Drums,
     Roblox,
@@ -89,6 +91,8 @@ pub struct Model {
     /// strikes allowed per `rate_win_ms` (0 = unlimited)
     pub rate: i32,
     pub rate_win_ms: i32,
+    /// 0 = off, 1..=3 (humanize::LEVEL_NAMES)
+    pub human: u8,
     pub pedal: bool,
     pub drums: bool,
     pub roblox_only: bool,
@@ -114,6 +118,7 @@ impl Default for Model {
             tol_ms: None,
             rate: 20,
             rate_win_ms: 100,
+            human: 0,
             pedal: true,
             drums: false,
             roblox_only: true,
@@ -143,6 +148,7 @@ impl Model {
             tolerance: self.tol_ms.map(|t| t as f64),
             rate_count: Some(self.rate as usize),
             rate_window: Some(self.rate_win_ms as f64),
+            human: self.human,
             ..Settings::default()
         }
     }
@@ -184,6 +190,8 @@ impl Model {
             Wid::RateUp => self.rate += 1,
             Wid::WinDn => self.rate_win_ms -= 10,
             Wid::WinUp => self.rate_win_ms += 10,
+            Wid::HumanDn => self.human = self.human.saturating_sub(1),
+            Wid::HumanUp => self.human = (self.human + 1).min(crate::humanize::LEVEL_NAMES.len() as u8 - 1),
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Drums => self.drums = !self.drums,
             Wid::Roblox => {
@@ -235,12 +243,13 @@ const M: f32 = 20.0;
 const RIGHT_W: f32 = 340.0;
 const VIS_CARD: R = R::new(M, 72.0, W - M * 3.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(M, H - M - 84.0, W - M * 3.0 - RIGHT_W, 84.0);
-const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, 412.0);
-const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + 412.0 + 12.0, RIGHT_W, H - M - (72.0 + 412.0 + 12.0));
+const SET_H: f32 = 454.0;
+const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
+const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
 const ROW0: f32 = SET_CARD.y + 56.0;
 const ROW_H: f32 = 42.0;
-const TOG0: f32 = ROW0 + ROW_H * 5.0 + 10.0;
+const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
 
 fn play_btn() -> (f32, f32, f32) {
@@ -270,7 +279,14 @@ pub fn widgets() -> Vec<(R, Wid)> {
     v.push((R::new(sx - sr, sy - sr, sr * 2.0, sr * 2.0), Wid::Stop));
     let sb = seek_bar();
     v.push((R::new(sb.x - 6.0, sb.y - 10.0, sb.w + 12.0, sb.h + 20.0), Wid::Seek));
-    let pairs = [(Wid::SpeedDn, Wid::SpeedUp), (Wid::TransDn, Wid::TransUp), (Wid::TolDn, Wid::TolUp), (Wid::RateDn, Wid::RateUp), (Wid::WinDn, Wid::WinUp)];
+    let pairs = [
+        (Wid::SpeedDn, Wid::SpeedUp),
+        (Wid::TransDn, Wid::TransUp),
+        (Wid::TolDn, Wid::TolUp),
+        (Wid::RateDn, Wid::RateUp),
+        (Wid::WinDn, Wid::WinUp),
+        (Wid::HumanDn, Wid::HumanUp),
+    ];
     for (i, (dn, up)) in pairs.iter().enumerate() {
         let (a, b) = stepper_rects(i);
         v.push((a, *dn));
@@ -569,7 +585,7 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 fn static_sig(cv: &Canvas, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms).hash(&mut h);
+    (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
     (m.pedal, m.drums, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, cv.s.to_bits()).hash(&mut h);
     if let Some(su) = &m.summary {
@@ -883,7 +899,7 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
         }
     };
 
-    let rows: [(&str, &str, String, Wid, Wid); 5] = [
+    let rows: [(&str, &str, String, Wid, Wid); 6] = [
         ("재생 속도", "", format!("{:.2}x", m.speed), Wid::SpeedDn, Wid::SpeedUp),
         ("이조", "반음 단위", format!("{:+}", m.transpose), Wid::TransDn, Wid::TransUp),
         (
@@ -909,6 +925,13 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             format!("{} ms", m.rate_win_ms),
             Wid::WinDn,
             Wid::WinUp,
+        ),
+        (
+            "사람처럼 연주",
+            "타이밍 오차 · 화음 엇갈림",
+            crate::humanize::LEVEL_NAMES[m.human as usize].into(),
+            Wid::HumanDn,
+            Wid::HumanUp,
         ),
     ];
     for (i, (t, sub, val, dn, up)) in rows.iter().enumerate() {
@@ -975,12 +998,12 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
 
     let total = (s.kept + s.dropped).max(1);
     let pct = 100.0 * s.kept as f64 / total as f64;
-    let y = c.y + 50.0;
+    let y = c.y + 44.0;
     let w = cv.text(c.x + 20.0, y, 30.0, true, col(TEXT, 1.0), &format!("{pct:.1}"));
     cv.text(c.x + 20.0 + w + 2.0, y + 13.0, 15.0, true, col(SUB, 1.0), "%");
     cv.text(c.x + 20.0 + w + 26.0, y + 15.0, 12.0, false, col(SUB, 1.0), "원래 자리에서 연주되는 음");
     // ratio bar
-    let by = y + 46.0;
+    let by = y + 42.0;
     let bwid = c.w - 40.0;
     cv.rr(c.x + 20.0, by, bwid, 6.0, 3.0, col(0x252D3F, 1.0));
     let p = hgrad(c.x + 20.0, c.x + 20.0 + bwid, col(ACCENT, 1.0), col(ACCENT2, 1.0));
@@ -995,7 +1018,7 @@ fn stats_card(cv: &mut Canvas, m: &Model) {
     let cw = (c.w - 40.0) / 4.0;
     for (i, (k, v)) in cells.iter().enumerate() {
         let x = c.x + 20.0 + i as f32 * cw;
-        cv.text(x, by + 20.0, 11.0, false, col(DIM, 1.0), k);
-        cv.text(x, by + 37.0, 14.5, true, col(TEXT, 1.0), v);
+        cv.text(x, by + 16.0, 11.0, false, col(DIM, 1.0), k);
+        cv.text(x, by + 32.0, 14.5, true, col(TEXT, 1.0), v);
     }
 }
