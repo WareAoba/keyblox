@@ -53,6 +53,17 @@ pub fn dwell_for_fps(fps: f64) -> i64 {
     (1_000_000.0 / fps * 1.25).round() as i64 + COALESCE_US
 }
 
+/// Roblox may miss a key struck right as playback starts (just after F6 or
+/// after its window comes to the front); songs with a silent intro never lose
+/// it. So the first key after a (re)start is sent at least this long after it.
+pub const START_LEAD_US: i64 = 500_000;
+
+/// Extra wait before resuming at song position `pos` when the next key is due
+/// at `next_t`: whatever is missing to START_LEAD_US.
+pub fn start_lead(pos: i64, next_t: i64) -> i64 {
+    (START_LEAD_US - (next_t - pos)).max(0)
+}
+
 impl Default for Params {
     fn default() -> Self {
         Params { dwell: DWELL_US, hold: 0, gap: 0, tolerance: auto_tolerance(DWELL_US), rate_count: 20, rate_window: 100_000 }
@@ -626,6 +637,16 @@ mod tests {
             let d = dwell_for_fps(fps);
             assert!(d - COALESCE_US > (1e6 / fps) as i64 && d < DWELL_US, "{fps}: {d}");
         }
+    }
+
+    /// A song that starts right away gets a lead-in; one with a silent intro
+    /// long enough does not, and the lead-in also covers a resume.
+    #[test]
+    fn start_lead_only_fills_the_gap() {
+        assert_eq!(start_lead(0, 0), START_LEAD_US);
+        assert_eq!(start_lead(0, 200_000), START_LEAD_US - 200_000);
+        assert_eq!(start_lead(0, 2_000_000), 0);
+        assert_eq!(start_lead(3_000_000, 3_000_000), START_LEAD_US);
     }
 
     fn on(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOn(n) } }

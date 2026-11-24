@@ -8,10 +8,11 @@
 //! * Roblox reads input once per frame, so events due within 1 ms are sent
 //!   together in ONE SendInput call (fewer syscalls in dense passages).
 //! * If the thread ever wakes late, due events are sent at once, in order.
+//! * After every (re)start the first key waits at least START_LEAD_US.
 //! * Keys are sent as hardware scancodes (KEYEVENTF_SCANCODE).
 
 use crate::layout::{SC_LCTRL, SC_LSHIFT, SC_SPACE};
-use crate::schedule::{Act, Action, COALESCE_US};
+use crate::schedule::{start_lead, Act, Action, COALESCE_US};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -69,7 +70,8 @@ pub fn state() -> u8 {
 /// Smooth song position (for the visualizer).
 pub fn position_us() -> i64 {
     if state() == ST_PLAYING {
-        since_epoch_us(Instant::now()) - ORIGIN_US.load(SeqCst)
+        // held at the resume position during the lead-in
+        (since_epoch_us(Instant::now()) - ORIGIN_US.load(SeqCst)).max(POS_US.load(SeqCst))
     } else {
         POS_US.load(SeqCst)
     }
@@ -316,7 +318,9 @@ fn playback() {
         send(&restore);
         let hwnd = TARGET_HWND.load(SeqCst);
         let any = ANY_WINDOW.load(SeqCst);
-        let origin = Instant::now() - pos;
+        // Roblox may miss a key struck right as playback starts: give it a lead-in
+        let lead = acts.get(idx).map_or(0, |a| start_lead(pos.as_micros() as i64, a.t.max(0)));
+        let origin = Instant::now() + Duration::from_micros(lead as u64) - pos;
         ORIGIN_US.store(since_epoch_us(origin), SeqCst);
 
         while idx < acts.len() {
@@ -369,7 +373,7 @@ fn playback() {
         }
         let sk = SEEK_US.load(SeqCst);
         if sk < 0 {
-            pos = Instant::now() - origin;
+            pos = Instant::now().saturating_duration_since(origin).max(pos); // paused in the lead-in: stay put
             POS_US.store(pos.as_micros() as i64, SeqCst);
         }
         release_all(&mut physical);
