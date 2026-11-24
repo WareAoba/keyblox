@@ -17,7 +17,7 @@ use tiny_skia::{
 };
 
 pub const W: f32 = 1120.0 + SIDE_W + M;
-pub const H: f32 = 700.0;
+pub const H: f32 = 742.0;
 const LOOKAHEAD_US: f64 = 2_600_000.0;
 
 // player states (same numbers as player.rs)
@@ -78,6 +78,8 @@ pub enum Wid {
     WinUp,
     HumanDn,
     HumanUp,
+    /// Roblox frame-rate choice (index into FPS_CHOICES)
+    Fps(u8),
     /// BPM / multiplier switch of the speed row
     SpeedUnit,
     Pedal,
@@ -101,7 +103,12 @@ pub struct Edit {
     pub fresh: bool,
 }
 
+/// Roblox max frame rates offered; the Shift/Ctrl wait follows the choice.
+pub const FPS_CHOICES: [u32; 5] = [60, 120, 144, 165, 240];
+
 pub struct Model {
+    /// index into FPS_CHOICES
+    pub fps_idx: usize,
     pub speed: f64,
     /// single-tempo songs: set speed as BPM (true) or as a multiplier
     pub speed_bpm: bool,
@@ -140,6 +147,7 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Model {
+            fps_idx: 0,
             speed: 1.0,
             speed_bpm: true,
             transpose: 0,
@@ -180,12 +188,16 @@ impl Model {
             rate_count: Some(self.rate as usize),
             rate_window: Some(self.rate_win_ms as f64),
             human: self.human,
+            dwell: Some(self.dwell_us() as f64 / 1000.0),
             ..Settings::default()
         }
     }
+    /// Shift/Ctrl wait for the chosen Roblox frame rate
+    fn dwell_us(&self) -> i64 {
+        crate::schedule::dwell_for_fps(FPS_CHOICES[self.fps_idx] as f64)
+    }
     pub fn auto_tol_ms(&self) -> i32 {
-        let p = crate::schedule::Params::default();
-        (p.tolerance as f64 / 1000.0).round() as i32
+        (crate::schedule::auto_tolerance(self.dwell_us()) as f64 / 1000.0).round() as i32
     }
     pub fn editable(&self) -> bool {
         matches!(self.state, ST_STOPPED | ST_DONE) && !self.analyzing
@@ -233,6 +245,7 @@ impl Model {
                 self.speed_bpm = !self.speed_bpm;
                 return false; // same speed, shown another way
             }
+            Wid::Fps(i) => self.fps_idx = (i as usize).min(FPS_CHOICES.len() - 1),
             Wid::Pedal => self.pedal = !self.pedal,
             Wid::Roblox => {
                 self.roblox_only = !self.roblox_only;
@@ -418,11 +431,13 @@ const LIST: R = R::new(SIDE_CARD.x + 8.0, SIDE_CARD.y + 94.0, SIDE_W - 16.0, SID
 const LIST_ROW_H: f32 = 30.0;
 const VIS_CARD: R = R::new(X0, 72.0, W - X0 - M * 2.0 - RIGHT_W, H - 72.0 - M - 84.0 - 12.0);
 const TRANSPORT: R = R::new(X0, H - M - 84.0, W - X0 - M * 2.0 - RIGHT_W, 84.0);
-const SET_H: f32 = 420.0;
+const SET_H: f32 = 462.0;
 const SET_CARD: R = R::new(W - M - RIGHT_W, 72.0, RIGHT_W, SET_H);
 const STAT_CARD: R = R::new(W - M - RIGHT_W, 72.0 + SET_H + 12.0, RIGHT_W, H - M - (72.0 + SET_H + 12.0));
 const OPEN_BTN: R = R::new(W - M - 150.0, 15.0, 150.0, 38.0);
-const ROW0: f32 = SET_CARD.y + 56.0;
+/// the Roblox FPS row sits above the stepper rows
+const FPS_ROW: f32 = SET_CARD.y + 56.0;
+const ROW0: f32 = FPS_ROW + 42.0;
 const ROW_H: f32 = 42.0;
 const TOG0: f32 = ROW0 + ROW_H * 6.0 + 10.0;
 const TOG_H: f32 = 34.0;
@@ -444,6 +459,13 @@ fn stepper_rects(row: usize) -> (R, R) {
 /// BPM / 배율 switch next to the "템포" label (single-tempo songs only).
 fn speed_unit_rect() -> R {
     R::new(SET_CARD.x + 58.0, ROW0 + 6.0, 78.0, 20.0)
+}
+/// Segment `i` of the Roblox FPS choice.
+fn fps_seg(i: usize) -> R {
+    let (_, b) = stepper_rects(0);
+    let x0 = SET_CARD.x + 168.0;
+    let w = (b.x + b.w - x0) / FPS_CHOICES.len() as f32;
+    R::new(x0 + w * i as f32, FPS_ROW + 6.0, w, 30.0)
 }
 fn field_rect(row: usize) -> R {
     let (a, b) = stepper_rects(row);
@@ -498,6 +520,9 @@ pub fn widgets(m: &Model) -> Vec<(R, Wid)> {
     }
     if m.base_bpm().is_some() {
         v.push((speed_unit_rect(), Wid::SpeedUnit));
+    }
+    for i in 0..FPS_CHOICES.len() {
+        v.push((fps_seg(i), Wid::Fps(i as u8)));
     }
     for (i, w) in [Wid::Pedal, Wid::Roblox, Wid::Vis].iter().enumerate() {
         v.push((toggle_row(i), *w));
@@ -816,7 +841,7 @@ fn key_x(p: u8, kb: &R) -> (f32, f32) {
 fn static_sig(scale: f32, m: &Model) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
+    (m.fps_idx, m.speed.to_bits(), m.transpose, m.tol_ms, m.rate, m.rate_win_ms, m.human).hash(&mut h);
     (m.pedal, m.speed_bpm, m.roblox_only, m.vis_on, &m.file_name, m.analyzing, &m.error).hash(&mut h);
     (m.state, m.hover, m.pressed, scale.to_bits()).hash(&mut h);
     m.edit.as_ref().map(|e| (e.row, &e.text, e.fresh)).hash(&mut h);
@@ -1201,6 +1226,25 @@ fn settings_card(cv: &mut Canvas, m: &Model) {
             cv.text(c.x + 20.0, y + 27.0, 10.5, false, col(DIM, la), sub);
         }
     };
+
+    // Roblox FPS: segmented choice
+    cv.text(c.x + 20.0, FPS_ROW + 8.0, 13.5, false, col(TEXT, la), "Roblox FPS");
+    cv.text(c.x + 20.0, FPS_ROW + 27.0, 10.5, false, col(DIM, la), "게임의 최대 프레임과 같게");
+    {
+        let (f, l) = (fps_seg(0), fps_seg(FPS_CHOICES.len() - 1));
+        cv.rr(f.x, f.y, l.x + l.w - f.x, f.h, 9.0, col(CARD2, 1.0));
+    }
+    for (i, v) in FPS_CHOICES.iter().enumerate() {
+        let r = fps_seg(i);
+        let sel = m.fps_idx == i;
+        if sel {
+            cv.rr(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 4.0, 7.0, col(ACCENT, la));
+        } else if m.hover == Some(Wid::Fps(i as u8)) && ed {
+            cv.rr(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 4.0, 7.0, col(0x283044, 1.0));
+        }
+        let a = if sel { la } else { 0.7 * la };
+        cv.text_c(r.cx(), r.cy() + 1.0, 12.5, sel, col(TEXT, a), &v.to_string());
+    }
 
     let (speed_label, speed_sub) = match m.base_bpm() {
         Some(b) => ("템포", format!("원곡 {} BPM", bpm_text(b))),

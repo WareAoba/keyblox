@@ -70,7 +70,7 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         dwell: ms(st.dwell, base.dwell),
         hold: ms(st.hold, base.hold),
         gap: ms(st.gap, base.gap),
-        tolerance: ms(st.tolerance, base.tolerance),
+        tolerance: ms(st.tolerance, schedule::auto_tolerance(ms(st.dwell, base.dwell))),
         rate_count: st.rate_count.unwrap_or(base.rate_count),
         rate_window: ms(st.rate_window, base.rate_window),
     };

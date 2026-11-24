@@ -47,6 +47,12 @@ pub const COALESCE_US: i64 = 1_000;
 /// frame jitter) plus the player's coalescing window.
 pub const DWELL_US: i64 = 20_833 + COALESCE_US;
 
+/// DWELL for a game running at `fps`: same rule as DWELL_US (1.25 frames
+/// plus the coalescing window).
+pub fn dwell_for_fps(fps: f64) -> i64 {
+    (1_000_000.0 / fps * 1.25).round() as i64 + COALESCE_US
+}
+
 impl Default for Params {
     fn default() -> Self {
         Params { dwell: DWELL_US, hold: 0, gap: 0, tolerance: auto_tolerance(DWELL_US), rate_count: 20, rate_window: 100_000 }
@@ -379,7 +385,9 @@ pub fn build(events: &[Ev], p: Params) -> Schedule {
     for (s, &(i, pt)) in path.iter().enumerate() {
         let nt = notes[i];
         tl.push((pt, 2, s as u32, K::On(nt.pitch, nt.t, s)));
-        tl.push((nt.off.max(pt), 0, s as u32, K::Off(nt.pitch, s)));
+        // a note planned at or after its own end is released right after its strike
+        let (ot, oc) = if nt.off > pt { (nt.off, 0) } else { (pt, 3) };
+        tl.push((ot, oc, s as u32, K::Off(nt.pitch, s)));
     }
     for (s, e) in events.iter().enumerate() {
         if let Kind::Pedal(on) = e.kind {
@@ -610,6 +618,16 @@ mod tests {
         assert!(d - COALESCE_US > 1_000_000 / 60, "dwell {d}us");
     }
 
+    /// A higher frame rate shortens the wait, but it still covers one frame.
+    #[test]
+    fn dwell_for_fps_matches_the_default_rule() {
+        assert!((dwell_for_fps(60.0) - DWELL_US).abs() <= 1);
+        for fps in [120.0, 144.0, 165.0, 240.0] {
+            let d = dwell_for_fps(fps);
+            assert!(d - COALESCE_US > (1e6 / fps) as i64 && d < DWELL_US, "{fps}: {d}");
+        }
+    }
+
     fn on(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOn(n) } }
     fn off(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOff(n) } }
 
@@ -675,6 +693,25 @@ mod tests {
         assert_eq!(s.dropped, 0);
         let t48 = s.actions.iter().find(|a| matches!(a.note, Some((48, _)))).unwrap().t;
         assert_eq!(t48, 5_000);
+    }
+
+    /// A note struck so late that its own end has already passed is still
+    /// released right away, not left down until the key is struck again.
+    #[test]
+    fn late_short_note_is_released() {
+        // chromatic run, 10 ms apart, 9.5 ms long: Shift switches push strikes past note ends
+        let s = check(&song(10_000, 40, &[60, 61, 62, 63, 64, 65, 66, 67]), P);
+        let mut down = [NEG; 128];
+        for a in &s.actions {
+            match a.act {
+                Act::Down(sc) => down[sc as usize] = a.t,
+                Act::Up(sc) if sc != SC_LSHIFT && sc != SC_LCTRL => {
+                    let held = a.t - down[sc as usize];
+                    assert!(held <= 9_500, "scan {sc:#x} held {held}us at {}", a.t);
+                }
+                Act::Up(_) => {}
+            }
+        }
     }
 
     #[test]
