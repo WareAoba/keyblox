@@ -58,6 +58,17 @@ cargo test --release
 Windows가 아닌 환경에서는 분석과 화면 미리보기(PNG)만 됩니다:
 `keyblox 곡.mid --preview out.png --at 60`
 
+## 실험 옵션
+화면에는 없고 환경 변수로만 켭니다. 켜면 창 제목에 `[실험: ...]`이 붙습니다. PowerShell에서:
+```
+$env:KEYBLOX_INPUT="unicode"; $env:KEYBLOX_FPS="240"; .\keyblox.exe
+```
+| 변수 | 값 | 하는 일 |
+|---|---|---|
+| `KEYBLOX_FPS` | 예: `120`, `240` | Shift/Ctrl 전환 대기를 그 fps 기준(1.25프레임 + 1ms)으로 줄입니다. Roblox가 실제로 그보다 느리면 검은건반이 틀린 음으로 납니다. |
+| `KEYBLOX_INPUT` | `unicode` | 검은건반을 Shift 없이 문자(`!`, `T` 등) 자체로 보냅니다. |
+| `KEYBLOX_INPUT` | `post` | SendInput 대신 "Roblox" 창에 키 메시지를 직접 넣습니다. 창이 뒤에 있어도 재생을 멈추지 않습니다. |
+
 ## 폴더 구조
 | 파일 | 역할 |
 |---|---|

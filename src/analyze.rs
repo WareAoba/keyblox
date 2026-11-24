@@ -65,7 +65,13 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         speed: st.speed.clamp(0.1, 10.0),
     };
     let parsed = midi::parse(bytes, &opt)?;
-    let base = schedule::Params::default();
+    let mut base = schedule::Params::default();
+    // Experiment (not in the UI): KEYBLOX_FPS=120/144/240 shortens the
+    // Shift/Ctrl wait to that frame rate. Wrong pitches if the game is slower.
+    let exp_fps = std::env::var("KEYBLOX_FPS").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|f| (30.0..=1000.0).contains(f));
+    if let Some(fps) = exp_fps {
+        base.dwell = schedule::dwell_for_fps(fps); // tolerance stays as is: only the wait changes
+    }
     let ms = |v: Option<f64>, d: i64| v.map(|x| (x * 1000.0).round() as i64).unwrap_or(d).max(0);
     let p = schedule::Params {
         dwell: ms(st.dwell, base.dwell),
@@ -102,6 +108,9 @@ pub fn analyze(bytes: &[u8], st: &Settings) -> Result<Analysis, String> {
         p.dwell as f64 / 1e3, p.tolerance as f64 / 1e3,
         if p.rate_count > 0 { format!("{}회 / {:.0}ms", p.rate_count, p.rate_window as f64 / 1e3) } else { "제한 없음".into() }
     ));
+    if let Some(fps) = exp_fps {
+        r.push(format!("실험: KEYBLOX_FPS={fps} (Shift/Ctrl 전환 대기를 {fps}fps 기준으로)"));
+    }
     if let Some(h) = human {
         r.push(format!(
             "사람처럼 연주: {} (타이밍 오차 표준편차 {:.0}ms, 화음 엇갈림 최대 {:.0}ms, 아래 지연은 이 시각 기준)",

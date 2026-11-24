@@ -573,7 +573,7 @@ pub fn run(initial: Option<String>) {
             hIconSm: null_mut(),
         };
         RegisterClassExW(&wc);
-        let title = w("keyblox");
+        let title = w(&format!("keyblox{}", player::experiment_label()));
         let hwnd = CreateWindowExW(
             0, class.as_ptr(), title.as_ptr(), STYLE, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
             null_mut(), null_mut(), hinst, null(),

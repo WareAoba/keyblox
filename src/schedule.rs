@@ -47,6 +47,12 @@ pub const COALESCE_US: i64 = 1_000;
 /// frame jitter) plus the player's coalescing window.
 pub const DWELL_US: i64 = 20_833 + COALESCE_US;
 
+/// DWELL for a game running at `fps` (same rule as DWELL_US: 1.25 frames
+/// plus the coalescing window). Used only by the KEYBLOX_FPS experiment.
+pub fn dwell_for_fps(fps: f64) -> i64 {
+    (1_000_000.0 / fps * 1.25).round() as i64 + COALESCE_US
+}
+
 impl Default for Params {
     fn default() -> Self {
         Params { dwell: DWELL_US, hold: 0, gap: 0, tolerance: auto_tolerance(DWELL_US), rate_count: 20, rate_window: 100_000 }
@@ -608,6 +614,16 @@ mod tests {
     fn default_dwell_covers_a_60fps_frame() {
         let d = Params::default().dwell;
         assert!(d - COALESCE_US > 1_000_000 / 60, "dwell {d}us");
+    }
+
+    /// The fps experiment uses the same rule as the fixed default.
+    #[test]
+    fn dwell_for_fps_matches_the_default_rule() {
+        assert!((dwell_for_fps(60.0) - DWELL_US).abs() <= 1);
+        for fps in [120.0, 144.0, 240.0] {
+            let d = dwell_for_fps(fps);
+            assert!(d - COALESCE_US > (1e6 / fps) as i64 && d < DWELL_US, "{fps}: {d}");
+        }
     }
 
     fn on(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOn(n) } }
