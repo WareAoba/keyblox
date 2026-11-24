@@ -35,6 +35,7 @@ pub const ST_PLAYING: u8 = 2;
 pub const ST_PAUSED: u8 = 3;
 pub const ST_LOST: u8 = 4; // paused because Roblox lost focus
 pub const ST_DONE: u8 = 5;
+pub const ST_COUNT: u8 = 6; // counting down before playing
 
 static STATE: AtomicU8 = AtomicU8::new(ST_STOPPED);
 static POS_US: AtomicI64 = AtomicI64::new(0);
@@ -48,6 +49,8 @@ static OWN_HWND: AtomicUsize = AtomicUsize::new(0);
 static ACTIONS: Mutex<Option<Arc<Vec<Action>>>> = Mutex::new(None);
 static ORIGIN_US: AtomicI64 = AtomicI64::new(0); // song start, in us since EPOCH
 static SEEK_US: AtomicI64 = AtomicI64::new(-1);
+static COUNT_MS: AtomicI64 = AtomicI64::new(0);
+static COUNT_END_US: AtomicI64 = AtomicI64::new(0); // since EPOCH
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 static PLAYBACK: OnceLock<thread::Thread> = OnceLock::new();
 
@@ -79,6 +82,14 @@ pub fn seek(us: i64) {
     POS_US.store(us.max(0), SeqCst);
     SEEK_US.store(us.max(0), SeqCst);
     wake();
+}
+/// Time left before a counted-down start (state ST_COUNT).
+pub fn countdown_left_us() -> i64 {
+    COUNT_END_US.load(SeqCst) - since_epoch_us(Instant::now())
+}
+/// Seconds to count down before playback starts (0 = start at once).
+pub fn set_countdown(secs: i32) {
+    COUNT_MS.store(secs.max(0) as i64 * 1000, SeqCst);
 }
 pub fn input_blocked() -> bool {
     BLOCKED.load(SeqCst)
@@ -112,11 +123,10 @@ pub fn toggle() {
         return;
     }
     match state() {
-        ST_PLAYING => STATE.store(ST_PAUSED, SeqCst),
-        ST_ARMED => STATE.store(ST_PAUSED, SeqCst),
+        ST_PLAYING | ST_ARMED | ST_COUNT => STATE.store(ST_PAUSED, SeqCst),
         _ => {
             if target_in_front() {
-                start_now();
+                begin();
             } else {
                 STATE.store(ST_ARMED, SeqCst);
             }
@@ -135,11 +145,23 @@ pub fn shutdown() {
     }
 }
 
-fn start_now() {
-    TARGET_HWND.store(foreground(), SeqCst);
+/// The target window is in front: count down, or play at once.
+fn begin() {
     if state() == ST_DONE {
         STOP.store(true, SeqCst);
+        wake();
     }
+    let ms = COUNT_MS.load(SeqCst);
+    if ms == 0 {
+        start_now();
+    } else {
+        COUNT_END_US.store(since_epoch_us(Instant::now()) + ms * 1000, SeqCst);
+        STATE.store(ST_COUNT, SeqCst);
+    }
+}
+
+fn start_now() {
+    TARGET_HWND.store(foreground(), SeqCst);
     STATE.store(ST_PLAYING, SeqCst);
     wake();
 }
@@ -398,7 +420,7 @@ fn hotkeys() {
                 // give the click that focused Roblox a moment to finish
                 let since = *armed_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(400) && state() == ST_ARMED {
-                    start_now();
+                    begin();
                     armed_since = None;
                 }
             } else {
@@ -406,6 +428,17 @@ fn hotkeys() {
             }
         } else {
             armed_since = None;
+        }
+        if state() == ST_COUNT {
+            if !target_in_front() {
+                // left Roblox mid-count: wait for it again, then count afresh
+                let _ = STATE.compare_exchange(ST_COUNT, ST_ARMED, SeqCst, SeqCst);
+            } else if countdown_left_us() <= 0 {
+                TARGET_HWND.store(foreground(), SeqCst);
+                if STATE.compare_exchange(ST_COUNT, ST_PLAYING, SeqCst, SeqCst).is_ok() {
+                    wake();
+                }
+            }
         }
         thread::sleep(Duration::from_millis(3));
     }

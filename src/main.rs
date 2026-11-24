@@ -61,6 +61,8 @@ fn main() {
         }
         m.pos_us = (at * 1e6) as i64;
         m.state = if at > 0.0 { ui::ST_PLAYING } else { ui::ST_STOPPED };
+        if let Some(c) = val("--count") { m.state = ui::ST_COUNT; m.count_left_us = (c * 1e6) as i64; }
+        if args.iter().any(|a| a == "--armed") { m.state = ui::ST_ARMED; }
         if args.iter().any(|a| a == "--hover-play") { m.hover = Some(ui::Wid::Play); }
         if let Some(i) = args.iter().position(|a| a == "--songs") {
             let mut lib = library::Library::default();
@@ -75,6 +77,9 @@ fn main() {
         if let Some(i) = args.iter().position(|a| a == "--edit") {
             let (r, t) = args[i + 1].split_once(':').unwrap();
             m.edit = Some(ui::Edit { row: r.parse().unwrap(), text: t.trim_start_matches('*').into(), fresh: t.starts_with('*') });
+        }
+        if let Some(i) = args.iter().position(|a| a == "--badge") {
+            ui::render_badge(&mut cv, 3).save_png(&args[i + 1]).unwrap();
         }
         let t0 = std::time::Instant::now();
         let n = 30;

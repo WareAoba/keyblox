@@ -14,7 +14,8 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint, InvalidateRect, SelectObject,
+    SetDIBitsToDevice, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     PAINTSTRUCT, ScreenToClient,
 };
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
@@ -52,6 +53,10 @@ struct App {
     last_frame: (u8, i64, bool, Option<Wid>),
     dirty: bool,
     hold: Option<Hold>,
+    /// click-through countdown badge shown over the Roblox window
+    badge: HWND,
+    /// digit the badge shows (0 = hidden)
+    badge_digit: i64,
 }
 
 /// A -/+ button being held down: repeats until released.
@@ -374,6 +379,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 m.state = player::state();
                 m.pos_us = player::position_us().min(m.length_us().max(0));
                 m.blocked = player::input_blocked();
+                m.count_left_us = player::countdown_left_us();
+                player::set_countdown(m.countdown); // one place for every way the value changes
                 if m.edit.is_some() && !m.editable() {
                     m.cancel_edit(); // playback started (F6) while typing
                     a.dirty = true;
@@ -391,6 +398,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         a.dirty = true;
                     }
                 }
+                let digit = ui::count_digit(m);
+                if digit != a.badge_digit {
+                    a.badge_digit = digit;
+                    show_badge(a, digit);
+                }
+                let m = &mut a.model;
                 if IsIconic(hwnd) != 0 {
                     return; // nothing to show; restoring repaints the whole window
                 }
@@ -640,6 +653,85 @@ fn window_size(scale: f32, dpi: u32) -> (i32, i32) {
     (rc.right - rc.left, rc.bottom - rc.top)
 }
 
+/// A topmost layered popup that never takes focus or clicks, so input keeps
+/// going to Roblox while it shows the countdown.
+unsafe fn create_badge(hinst: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
+    let class = w("keyblox_badge");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(DefWindowProcW),
+        hInstance: hinst,
+        lpszClassName: class.as_ptr(),
+        ..std::mem::zeroed()
+    };
+    RegisterClassExW(&wc);
+    let ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    CreateWindowExW(ex, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), hinst, null())
+}
+
+/// Show `digit` on the badge over the window in front (0 hides it).
+/// Purely visual: any failure just leaves the badge hidden.
+fn show_badge(a: &mut App, digit: i64) {
+    unsafe {
+        if a.badge.is_null() {
+            return;
+        }
+        if digit == 0 || !paint_badge(a, digit) {
+            ShowWindow(a.badge, SW_HIDE);
+            return;
+        }
+        SetWindowPos(a.badge, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+unsafe fn paint_badge(a: &mut App, digit: i64) -> bool {
+    let pm = ui::render_badge(&mut a.cv, digit);
+    let side = pm.width() as i32;
+    // centered on the target window, a third of the way down
+    let mut rc: RECT = std::mem::zeroed();
+    if GetWindowRect(GetForegroundWindow(), &mut rc) == 0 {
+        return false;
+    }
+    let pos = POINT {
+        x: rc.left + (rc.right - rc.left - side) / 2,
+        y: rc.top + (rc.bottom - rc.top - side) * 3 / 10,
+    };
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: side,
+        biHeight: -side, // top-down
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB as u32,
+        ..std::mem::zeroed()
+    };
+    let dc = CreateCompatibleDC(null_mut());
+    if dc.is_null() {
+        return false;
+    }
+    let mut bits: *mut std::ffi::c_void = null_mut();
+    let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if bmp.is_null() || bits.is_null() {
+        DeleteDC(dc);
+        return false;
+    }
+    // tiny-skia: premultiplied RGBA -> layered windows: premultiplied BGRA
+    let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (side * side * 4) as usize);
+    for (d, s) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
+        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+    }
+    let old = SelectObject(dc, bmp);
+    let size = windows_sys::Win32::Foundation::SIZE { cx: side, cy: side };
+    let src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+    let ok = UpdateLayeredWindow(a.badge, null_mut(), &pos, &size, dc, &src, 0, &blend, ULW_ALPHA) != 0;
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ok
+}
+
 pub fn run(initial: Option<String>) {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -698,6 +790,8 @@ pub fn run(initial: Option<String>) {
                 last_frame: (255, -1, false, None),
                 dirty: true,
                 hold: None,
+                badge: create_badge(hinst),
+                badge_digit: 0,
             })
         });
         with_app(refresh_songs);
