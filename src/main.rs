@@ -22,12 +22,11 @@ fn main() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: keyblox <file.mid> [--fps N] [--tol MS] [--dump-ons]");
+        eprintln!("usage: keyblox <file.mid> [--tol MS] [--dump-ons]");
         std::process::exit(1);
     };
     let mut st = analyze::Settings::default();
     let val = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
-    if let Some(f) = val("--fps") { st.fps = f; }
     if let Some(t) = val("--tol") { st.tolerance = Some(t); }
     if let Some(r) = val("--rate") { st.max_rate = Some(r); }
     let bytes = std::fs::read(path).expect("read");
@@ -48,7 +47,6 @@ fn main() {
         let fonts = ui::Fonts::load(&reg, 1, &bold, 1).unwrap();
         let mut cv = ui::Canvas::new(scale, fonts);
         let mut m = ui::Model::default();
-        if let Some(f) = val("--fps") { m.fps_idx = ui::FPS_CHOICES.iter().position(|&x| x == f).unwrap_or(0); }
         let a = analyze::analyze(&bytes, &m.settings()).unwrap();
         if !args.iter().any(|a| a == "--empty") {
             m.file_name = Some(path.rsplit('/').next().unwrap().to_string());

@@ -4,7 +4,8 @@
 //! The one hard limit: Roblox reads Shift/Ctrl when it *processes* a key,
 //! once per frame. So after a key-down made with modifier state X, the
 //! state may only change once a frame has surely passed (DWELL); otherwise
-//! the note sounds as the wrong pitch (e.g. `T` as `t`).
+//! the note sounds as the wrong pitch (e.g. `T` as `t`). DWELL is fixed to
+//! cover a 60 fps frame (Roblox's default cap), so it also holds at higher fps.
 //!
 //! Notes are never pushed back. Each note is struck at its own time (or at
 //! most `tolerance` later, enough to roll a mixed white/black chord); a note
@@ -39,11 +40,13 @@ pub fn auto_tolerance(dwell: i64) -> i64 {
 /// the dwell default includes it so the modifier rule still holds.
 pub const COALESCE_US: i64 = 1_000;
 
-impl Params {
-    pub fn from_fps(fps: f64) -> Self {
-        // 1.25 frames: guarantees a frame boundary with margin for frame jitter
-        let f = (1_000_000.0 / fps * 1.25).round() as i64;
-        Params { dwell: f + COALESCE_US, hold: 0, gap: 0, tolerance: auto_tolerance(f + COALESCE_US), max_rate: 200.0 }
+/// Default DWELL: 1.25 frames at 60 fps (a frame boundary with margin for
+/// frame jitter) plus the player's coalescing window.
+pub const DWELL_US: i64 = 20_833 + COALESCE_US;
+
+impl Default for Params {
+    fn default() -> Self {
+        Params { dwell: DWELL_US, hold: 0, gap: 0, tolerance: auto_tolerance(DWELL_US), max_rate: 200.0 }
     }
 }
 
@@ -586,6 +589,13 @@ mod tests {
     use super::*;
 
     const P: Params = Params { dwell: 20_000, hold: 0, gap: 0, tolerance: 20_000, max_rate: 0.0 };
+
+    /// The fixed DWELL must outlast one 60 fps frame even when the player sends early.
+    #[test]
+    fn default_dwell_covers_a_60fps_frame() {
+        let d = Params::default().dwell;
+        assert!(d - COALESCE_US > 1_000_000 / 60, "dwell {d}us");
+    }
 
     fn on(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOn(n) } }
     fn off(t: i64, n: u8) -> Ev { Ev { t, kind: Kind::NoteOff(n) } }
